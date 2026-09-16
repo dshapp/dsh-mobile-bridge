@@ -14,7 +14,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-connection'
 import type {} from '@deepseek-ai/dsh-credentials'
 import type {} from '@deepseek-ai/dsh-api-gateway/types'
-import { registerControlApi } from './api.ts'
+import { localDeviceName, registerControlApi } from './api.ts'
 import { createMobileServer } from './http.ts'
 import { serveStream } from './session.ts'
 import { DeviceRegistry, encodeKey, loadIdentity } from './store.ts'
@@ -36,6 +36,8 @@ export interface Config {
   proxyPublicKey?: string
   /** Days a paired device stays valid. */
   deviceTtlDays?: number
+  /** Name phones show for this Mac; defaults to the computer's own name. */
+  deviceName?: string
 }
 
 /**
@@ -47,6 +49,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   const proxyHost = config.proxyHost ?? '127.0.0.1'
   const proxyPort = config.proxyPort ?? 8787
   const deviceTtlDays = config.deviceTtlDays ?? 180
+  const deviceName = (config.deviceName ?? '').trim() || localDeviceName()
 
   const identity = await loadIdentity(ctx.credentials)
   const devices = await DeviceRegistry.load(ctx.credentials, deviceTtlDays)
@@ -77,6 +80,6 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       await close()
     }
   }, 'mobile-bridge: proxy tunnel')
-  registerControlApi(ctx, { identity, devices, tunnel, proxyHost, proxyPort })
+  registerControlApi(ctx, { identity, devices, tunnel, proxyHost, proxyPort, deviceName })
   ctx.logger.info('mobile bridge key %s', encodeKey(identity.publicKey))
 }

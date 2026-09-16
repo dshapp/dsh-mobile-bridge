@@ -18,6 +18,12 @@ const PAIRING_TTL_MS = 5 * 60 * 1000
 /** Do not rewrite the store for every request; lastSeen is a coarse fact. */
 const TOUCH_INTERVAL_MS = 60 * 1000
 
+/** A one-shot pairing code and the moment it stops working. */
+export interface Pairing {
+  token: string
+  expiresAt: number
+}
+
 /** One paired phone. */
 export interface DeviceRecord {
   /** base64url X25519 public key — the device's whole identity. */
@@ -59,6 +65,8 @@ export async function loadIdentity(credentials: CredentialProvider): Promise<Key
 export class DeviceRegistry {
   private readonly devices = new Map<string, DeviceRecord>()
   private readonly pairings = new Map<string, number>()
+  /** Live connections per device — the difference between "paired" and "here". */
+  private readonly live = new Map<string, number>()
   private lastWrite = 0
 
   private constructor(
@@ -82,24 +90,42 @@ export class DeviceRegistry {
     return [...this.devices.values()].sort((a, b) => b.addedAt - a.addedAt)
   }
 
-  /** Mint a one-shot pairing token for a QR code. */
-  createPairing(): { token: string, expiresAt: number } {
+  /**
+   * Mint a one-shot pairing token for a QR code, replacing any unused one.
+   *
+   * Exactly one code is live at a time, so what a screen shows is what a phone
+   * can redeem — an abandoned code cannot come back to life days later.
+   */
+  createPairing(): Pairing {
+    this.pairings.clear()
+    const token = randomBytes(32).toString('base64url')
+    const expiresAt = Date.now() + PAIRING_TTL_MS
+    this.pairings.set(token, expiresAt)
+    return { token, expiresAt }
+  }
+
+  /**
+   * The code a screen should be showing, or null when there is none.
+   *
+   * Redeeming or expiring removes it, which is how a client learns — without
+   * a timer of its own — that the phone got in or that the code went stale.
+   */
+  activePairing(): Pairing | null {
     const now = Date.now()
     for (const [token, expiresAt] of this.pairings) {
       if (expiresAt <= now) this.pairings.delete(token)
+      else return { token, expiresAt }
     }
-    const token = randomBytes(32)
-    const expiresAt = now + PAIRING_TTL_MS
-    this.pairings.set(token.toString('base64url'), expiresAt)
-    return { token: token.toString('base64url'), expiresAt }
+    return null
   }
 
   /**
    * Decide whether one handshaked device may be served.
    * @param deviceKey - the device's static public key from the Noise handshake.
    * @param pairingToken - the first-message payload, when the device is new.
+   * @returns the device id when it may be served, or null when it may not.
    */
-  async authorize(deviceKey: Buffer, pairingToken: Buffer): Promise<boolean> {
+  async authorize(deviceKey: Buffer, pairingToken: Buffer): Promise<string | null> {
     const deviceId = encodeKey(deviceKey)
     const now = Date.now()
     const known = this.devices.get(deviceId)
@@ -108,9 +134,9 @@ export class DeviceRegistry {
         known.lastSeenAt = now
         await this.save()
       }
-      return true
+      return deviceId
     }
-    if (!this.consume(pairingToken, now)) return false
+    if (!this.consume(pairingToken, now)) return null
     this.devices.set(deviceId, {
       deviceId,
       label: `iPhone ${deviceId.slice(0, 6)}`,
@@ -119,7 +145,40 @@ export class DeviceRegistry {
       expiresAt: now + this.ttlDays * 24 * 60 * 60 * 1000,
     })
     await this.save()
-    return true
+    return deviceId
+  }
+
+  /**
+   * Count one live connection from a device.
+   *
+   * A phone opens a stream per HTTP connection, so presence is a count, not a
+   * flag: it is here until the last of them goes away.
+   * @param deviceId - the connecting device.
+   * @returns a release callback, safe to call more than once.
+   */
+  markOnline(deviceId: string): () => void {
+    this.live.set(deviceId, (this.live.get(deviceId) ?? 0) + 1)
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      const rest = (this.live.get(deviceId) ?? 1) - 1
+      if (rest > 0) {
+        this.live.set(deviceId, rest)
+        return
+      }
+      this.live.delete(deviceId)
+      // The moment it left is the "last seen" a person actually cares about.
+      const record = this.devices.get(deviceId)
+      if (record === undefined) return
+      record.lastSeenAt = Date.now()
+      if (Date.now() - this.lastWrite > TOUCH_INTERVAL_MS) void this.save().catch(() => {})
+    }
+  }
+
+  /** Whether this device has a connection open right now. */
+  isOnline(deviceId: string): boolean {
+    return this.live.has(deviceId)
   }
 
   /** Revoke one device; its next handshake fails. */

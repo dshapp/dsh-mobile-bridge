@@ -5,9 +5,11 @@
  * control socket and no state file of its own.
  */
 
+import { execFileSync } from 'node:child_process'
+import { hostname } from 'node:os'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ProxyTunnel } from './tunnel.ts'
-import { encodeKey, type DeviceRegistry } from './store.ts'
+import { encodeKey, type DeviceRegistry, type Pairing } from './store.ts'
 import type { KeyPair } from './noise.ts'
 
 /** What the control routes need to answer. */
@@ -17,32 +19,83 @@ export interface ControlDeps {
   readonly tunnel: ProxyTunnel
   readonly proxyHost: string
   readonly proxyPort: number
+  /** This Mac's own name, the label a phone shows for the pairing. */
+  readonly deviceName: string
 }
 
 /** Register status / pair / revoke under `/api/mobileBridge`. */
 export function registerControlApi(ctx: Context, deps: ControlDeps): void {
   route(ctx, 'status', () => status(deps))
-  route(ctx, 'pair', () => {
-    const { token, expiresAt } = deps.devices.createPairing()
-    const key = encodeKey(deps.identity.publicKey)
-    return {
-      url: `dshm://${deps.proxyHost}:${String(deps.proxyPort)}/${key}#${token}`,
-      expiresAt,
-    }
-  })
+  route(ctx, 'pair', () => ({
+    ...pairingView(deps, deps.devices.createPairing()),
+    deviceName: deps.deviceName,
+  }))
   route(ctx, 'revoke', async (args) => {
     const deviceId = typeof args.deviceId === 'string' ? args.deviceId : ''
     return { removed: await deps.devices.revoke(deviceId) }
   })
 }
 
+/**
+ * Everything a pairing screen shows, in one read with no side effects.
+ *
+ * `pairing` is the live code or null — polling it is how a client learns that
+ * the phone redeemed the code or that it went stale, without a local timer.
+ */
 function status(deps: ControlDeps): Record<string, unknown> {
+  const pairing = deps.devices.activePairing()
   return {
     bridgeKey: encodeKey(deps.identity.publicKey),
     proxyHost: deps.proxyHost,
     proxyPort: deps.proxyPort,
     connected: deps.tunnel.connected,
-    devices: deps.devices.list(),
+    deviceName: deps.deviceName,
+    now: Date.now(),
+    pairing: pairing === null ? null : pairingView(deps, pairing),
+    // `online` is the live connection count, not a guess from `lastSeenAt`.
+    devices: deps.devices.list().map((device) => ({
+      ...device,
+      online: deps.devices.isOnline(device.deviceId),
+    })),
+  }
+}
+
+/**
+ * The pairing as a client displays it: the exact text that goes into the QR.
+ *
+ * Drawing that text is the screen's job; the bridge owns what it says. The
+ * proxy is a shared relay whose address names nothing, so this Mac's own name
+ * rides along — the only moment a phone can learn it — and becomes the default
+ * label of the pairing there.
+ */
+function pairingView(deps: ControlDeps, pairing: Pairing): { url: string, expiresAt: number } {
+  const key = encodeKey(deps.identity.publicKey)
+  const name = deps.deviceName === '' ? '' : `?name=${encodeURIComponent(deps.deviceName)}`
+  return {
+    url: `dshm://${deps.proxyHost}:${String(deps.proxyPort)}/${key}${name}#${pairing.token}`,
+    expiresAt: pairing.expiresAt,
+  }
+}
+
+/**
+ * This Mac's name as its owner knows it: the Sharing pane's computer name on
+ * macOS, the network hostname anywhere else, with the mDNS suffix dropped.
+ * @returns a human name, or the empty string when the machine has none.
+ */
+export function localDeviceName(): string {
+  if (process.platform === 'darwin') {
+    const name = runQuietly('/usr/sbin/scutil', ['--get', 'ComputerName'])
+    if (name !== '') return name
+  }
+  return hostname().replace(/\.(local|lan)$/i, '').trim()
+}
+
+/** A best-effort command: a missing binary or a slow one yields no name. */
+function runQuietly(file: string, args: string[]): string {
+  try {
+    return execFileSync(file, args, { encoding: 'utf8', timeout: 1000, stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+  } catch {
+    return ''
   }
 }
 

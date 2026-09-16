@@ -42,9 +42,18 @@ Three exact routes on the shared channel, for the Mac app:
 
 | route | answer |
 |---|---|
-| `POST /api/mobileBridge/status` | `bridgeKey`, proxy address, `connected`, paired `devices` |
-| `POST /api/mobileBridge/pair` | one-shot `dshm://` pairing URL and its expiry |
+| `POST /api/mobileBridge/status` | `bridgeKey`, proxy address, `connected`, `deviceName`, `now`, the live `pairing` (or `null`), paired `devices` |
+| `POST /api/mobileBridge/pair` | a fresh one-shot `dshm://` pairing URL, its expiry and `deviceName` |
 | `POST /api/mobileBridge/revoke` | `{ removed }` for one `deviceId` |
+
+Each device carries `online`: the bridge counts the streams a phone actually
+holds, so presence is observed, not guessed from `lastSeenAt` — which is
+refreshed the moment the last of those streams goes away.
+
+`status` answers everything a pairing screen displays and changes nothing:
+the live code disappears from it the moment a phone redeems it or it expires,
+so a client needs no timer of its own. Turning that URL into a QR code is the
+screen's job — the bridge owns what the code says, not how it is drawn.
 
 ## Develop
 

@@ -52,10 +52,16 @@ export async function serveStream(stream: MuxStream, deps: SessionDeps): Promise
     return
   }
   const deviceKey = handshake.remoteStatic
-  if (deviceKey === undefined || !await deps.devices.authorize(deviceKey, pairingToken)) {
+  const deviceId = deviceKey === undefined ? null : await deps.devices.authorize(deviceKey, pairingToken)
+  if (deviceId === null) {
     stream.close()
     return
   }
+
+  // Presence is the stream's lifetime: the phone is "here" exactly as long as
+  // it holds a connection, and the release runs however the stream dies.
+  const release = deps.devices.markOnline(deviceId)
+  stream.onEnd(release)
 
   await writeFrame(stream, handshake.write())
   deps.server.emit('connection', new NoiseSocket(stream, handshake.split()))

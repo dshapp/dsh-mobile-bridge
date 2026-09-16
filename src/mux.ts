@@ -27,6 +27,7 @@ export class MuxStream {
   /** Bytes we may still send before the proxy returns credit. */
   private credit = WINDOW
   private drains: (() => void)[] = []
+  private enders: (() => void)[] = []
 
   constructor(readonly id: number, private readonly link: MuxLink) {}
 
@@ -51,6 +52,15 @@ export class MuxStream {
       this.link.send(this.id, KIND_DATA, rest.subarray(0, take))
       rest = rest.subarray(take)
     }
+  }
+
+  /**
+   * Run `listener` once this stream ends, however it ends.
+   * @param listener - called on local close, remote CLOSE, or a dropped link.
+   */
+  onEnd(listener: () => void): void {
+    if (this.ended) listener()
+    else this.enders.push(listener)
   }
 
   /** Close this stream on both ends. */
@@ -83,6 +93,9 @@ export class MuxStream {
     const drains = this.drains
     this.drains = []
     for (const resolve of drains) resolve()
+    const enders = this.enders
+    this.enders = []
+    for (const listener of enders) listener()
   }
 
   private settle(): void {

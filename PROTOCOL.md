@@ -65,9 +65,15 @@ Anything outside `/api` answers 404.
 ## 5. Pairing
 
 ```
-dshm://<proxyHost>:<proxyPort>/<base64url bridgeKey>#<base64url pairingToken>
+dshm://<proxyHost>:<proxyPort>/<base64url bridgeKey>?name=<this Mac's name>#<base64url pairingToken>
 ```
 
-The token is 32 random bytes, valid 5 minutes, single use, memory only. The
-device's X25519 public key becomes its id and is stored with a 180-day
-expiry; revoking it takes effect on the next handshake.
+The token is 32 random bytes, valid 5 minutes, single use, memory only, and at
+most one is live at a time — minting a code retires the previous unused one, so
+the code on screen is the only code that works. The device's X25519 public key
+becomes its id and is stored with a 180-day expiry; revoking it takes effect on
+the next handshake.
+
+`name` is percent-encoded and optional: the proxy is a shared relay whose
+address identifies nothing, so the QR carries this Mac's own name and the phone
+uses it as the default label for the pairing. A payload without it stays valid.
