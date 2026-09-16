@@ -1,0 +1,70 @@
+{
+  "name": "dsh-mobile-bridge",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness (DSH) bundle: serves the harness API to paired mobile devices over a Noise-encrypted tunnel, without opening a port.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis-plugin",
+    "noise-protocol",
+    "mobile"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dshapp/dsh-mobile-bridge.git"
+  },
+  "homepage": "https://github.com/dshapp/dsh-mobile-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/dshapp/dsh-mobile-bridge/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.19"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/**/*.js",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.1.5-rc.2"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-api-gateway": "^0.1.5-rc.2",
+    "@deepseek-ai/dsh-client-connection": "^0.1.5-rc.2",
+    "@deepseek-ai/dsh-credentials": "^0.1.5-rc.2",
+    "@types/node": "^22.20.1",
+    "@types/ws": "^8.5.13",
+    "tsdown": "^0.22.14",
+    "typescript": "^5.7.0"
+  },
+  "scripts": {
+    "build": "tsdown",
+    "prepare": "tsdown",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "check": "npm run typecheck && npm run build"
+  }
+}

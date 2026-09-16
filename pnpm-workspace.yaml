@@ -1,0 +1,4 @@
+# Harness packages peer-depend on a cordis range that is not published yet, and
+# every harness import here is type-only, so peers are not chased.
+autoInstallPeers: false
+strictPeerDependencies: false

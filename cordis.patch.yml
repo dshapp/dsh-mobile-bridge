@@ -1,0 +1,6 @@
+# dsh mobile access: serves this harness's /api to paired phones over a
+# Noise-encrypted tunnel to a public dsh-proxy. The plugin listens on no port
+# of its own and lives exactly as long as the dsh server process.
+- insert:
+    - id: mobile-bridge
+      name: 'dsh-mobile-bridge'
