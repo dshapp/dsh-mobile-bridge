@@ -3,6 +3,11 @@
  * channel, answering the same envelope every other harness endpoint does. The
  * app therefore needs no new transport — and the bridge needs no port, no
  * control socket and no state file of its own.
+ *
+ * These are *control* routes, not phone routes: `pair` mints a pairing code
+ * and `revoke` ejects a device. The mobile server refuses `/api/mobileBridge/*`
+ * to phones (see http.ts), so the only way in is the app's authenticated
+ * localhost web channel. Phones are meant to reach the RPC channel, never this.
  */
 
 import { execFileSync } from 'node:child_process'

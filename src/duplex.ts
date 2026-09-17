@@ -8,7 +8,7 @@
 
 import { Duplex } from 'node:stream'
 import type { MuxStream } from './mux.ts'
-import type { NoiseTransport } from './noise.ts'
+import { NOISE_TAG_LEN, type NoiseTransport } from './noise.ts'
 import { MAX_NOISE_PLAINTEXT } from './wire.ts'
 
 /** A Noise transport presented as a socket-like Duplex. */
@@ -40,23 +40,34 @@ export class NoiseSocket extends Duplex {
   }
 
   override _write(chunk: Buffer, _encoding: BufferEncoding, done: (error?: Error | null) => void): void {
-    void (async () => {
-      try {
-        let rest = chunk
-        while (rest.length > 0) {
-          const take = Math.min(rest.length, MAX_NOISE_PLAINTEXT)
-          const sealed = this.transport.encrypt(rest.subarray(0, take))
-          const frame = Buffer.alloc(2 + sealed.length)
-          frame.writeUInt16BE(sealed.length, 0)
-          sealed.copy(frame, 2)
-          await this.stream.write(frame)
-          rest = rest.subarray(take)
-        }
-        done()
-      } catch (error) {
-        done(error as Error)
-      }
-    })()
+    void this.seal(chunk).then(() => { done() }, (error: unknown) => { done(error as Error) })
+  }
+
+  /**
+   * Seal a corked batch as one Noise message.
+   *
+   * node:http correlates a response head with its first body chunk, and
+   * without this each half became its own message — two cipher setups and two
+   * mux frames where one would do.
+   */
+  override _writev(chunks: { chunk: Buffer, encoding: BufferEncoding }[], done: (error?: Error | null) => void): void {
+    const joined = chunks.length === 1
+      ? chunks[0]?.chunk ?? Buffer.alloc(0)
+      : Buffer.concat(chunks.map(({ chunk }) => chunk))
+    void this.seal(joined).then(() => { done() }, (error: unknown) => { done(error as Error) })
+  }
+
+  private async seal(data: Buffer): Promise<void> {
+    let rest = data
+    while (rest.length > 0) {
+      const take = Math.min(rest.length, MAX_NOISE_PLAINTEXT)
+      // Reserve the length prefix, then seal straight in behind it.
+      const frame = Buffer.allocUnsafe(2 + take + NOISE_TAG_LEN)
+      const sealed = this.transport.sealInto(rest.subarray(0, take), frame, 2)
+      frame.writeUInt16BE(sealed, 0)
+      await this.stream.write(frame.subarray(0, 2 + sealed))
+      rest = rest.subarray(take)
+    }
   }
 
   override _final(done: (error?: Error | null) => void): void {

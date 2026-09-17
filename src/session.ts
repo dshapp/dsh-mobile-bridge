@@ -17,11 +17,26 @@ export interface SessionDeps {
   readonly identity: KeyPair
   readonly devices: DeviceRegistry
   readonly server: Server
+  /**
+   * Milliseconds the preamble and the Noise handshake may take, together.
+   *
+   * Without it an unauthenticated caller who knows the public bridge key can
+   * send a valid preamble and then go silent, holding one of the proxy's
+   * per-bridge stream slots forever — enough to lock the real phone out.
+   */
+  readonly handshakeTimeoutMs?: number
 }
+
+/** A new connection gets this long to prove it is a device. */
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000
 
 /** Serve one stream opened by the proxy for a mobile client. */
 export async function serveStream(stream: MuxStream, deps: SessionDeps): Promise<void> {
-  const preamble = await stream.readExactly(HEAD_LEN)
+  const timeoutMs = deps.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS
+  // One deadline for the whole unauthenticated phase: the caller gets no
+  // credit for starting a handshake, only for finishing one.
+  const deadline = Date.now() + timeoutMs
+  const preamble = await within(stream.readExactly(HEAD_LEN), deadline)
   if (
     preamble === undefined
     || !preamble.subarray(0, 4).equals(MAGIC_CLIENT)
@@ -39,7 +54,7 @@ export async function serveStream(stream: MuxStream, deps: SessionDeps): Promise
     prologue: preamble,
   })
 
-  const first = await readFrame(stream)
+  const first = await within(readFrame(stream), deadline)
   if (first === undefined) {
     stream.close()
     return
@@ -59,12 +74,41 @@ export async function serveStream(stream: MuxStream, deps: SessionDeps): Promise
   }
 
   // Presence is the stream's lifetime: the phone is "here" exactly as long as
-  // it holds a connection, and the release runs however the stream dies.
-  const release = deps.devices.markOnline(deviceId)
+  // it holds a connection, and the release runs however the stream dies. The
+  // registry keeps `dispose` so revoking the device hangs up on it at once.
+  //
+  // `split()` only yields keys once the handshake is complete, which the
+  // responder's final `write()` below is what completes — so the disposer
+  // closes the raw stream until the socket exists to close instead.
+  let socket: NoiseSocket | undefined
+  const release = deps.devices.attach(deviceId, () => {
+    if (socket === undefined) stream.close()
+    else socket.destroy()
+  })
   stream.onEnd(release)
 
   await writeFrame(stream, handshake.write())
-  deps.server.emit('connection', new NoiseSocket(stream, handshake.split()))
+  socket = new NoiseSocket(stream, handshake.split())
+  deps.server.emit('connection', socket)
+}
+
+/**
+ * Race one unauthenticated read against a deadline.
+ * @param read - the pending read.
+ * @param deadline - epoch milliseconds it must finish by.
+ * @returns the read's value, or `undefined` if the deadline passed first.
+ */
+function within<T>(read: Promise<T | undefined>, deadline: number): Promise<T | undefined> {
+  const remaining = deadline - Date.now()
+  if (remaining <= 0) return Promise.resolve(undefined)
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => { resolve(undefined) }, remaining)
+    timer.unref()
+    void read.then(
+      (value) => { clearTimeout(timer); resolve(value) },
+      () => { clearTimeout(timer); resolve(undefined) },
+    )
+  })
 }
 
 async function readFrame(stream: MuxStream): Promise<Buffer | undefined> {

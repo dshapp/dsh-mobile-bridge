@@ -65,8 +65,12 @@ export async function loadIdentity(credentials: CredentialProvider): Promise<Key
 export class DeviceRegistry {
   private readonly devices = new Map<string, DeviceRecord>()
   private readonly pairings = new Map<string, number>()
-  /** Live connections per device — the difference between "paired" and "here". */
-  private readonly live = new Map<string, number>()
+  /**
+   * How to hang up on each device, keyed by device id — the difference between
+   * "paired" and "here", and the only way a revocation can affect a connection
+   * that was already admitted.
+   */
+  private readonly live = new Map<string, Set<() => void>>()
   private lastWrite = 0
 
   private constructor(
@@ -128,6 +132,9 @@ export class DeviceRegistry {
   async authorize(deviceKey: Buffer, pairingToken: Buffer): Promise<string | null> {
     const deviceId = encodeKey(deviceKey)
     const now = Date.now()
+    // A device that expired while still connected keeps its session until
+    // something notices; noticing here costs one pass over the whitelist.
+    await this.expire(now)
     const known = this.devices.get(deviceId)
     if (known !== undefined && known.expiresAt > now) {
       if (now - this.lastWrite > TOUCH_INTERVAL_MS) {
@@ -137,6 +144,9 @@ export class DeviceRegistry {
       return deviceId
     }
     if (!this.consume(pairingToken, now)) return null
+    // A device re-pairing under a key that already has connections (it
+    // expired, then paired again) must not keep the old ones alive.
+    this.disconnect(deviceId)
     this.devices.set(deviceId, {
       deviceId,
       label: `iPhone ${deviceId.slice(0, 6)}`,
@@ -149,24 +159,28 @@ export class DeviceRegistry {
   }
 
   /**
-   * Count one live connection from a device.
+   * Register one live connection from a device.
    *
-   * A phone opens a stream per HTTP connection, so presence is a count, not a
-   * flag: it is here until the last of them goes away.
+   * A phone opens a stream per HTTP connection, so presence is a set, not a
+   * flag: the device is here until the last of its connections goes away. The
+   * `dispose` callback is also kept as the handle {@link revoke} uses to hang
+   * up on a device that is already admitted.
    * @param deviceId - the connecting device.
+   * @param dispose - how to end this connection.
    * @returns a release callback, safe to call more than once.
    */
-  markOnline(deviceId: string): () => void {
-    this.live.set(deviceId, (this.live.get(deviceId) ?? 0) + 1)
+  attach(deviceId: string, dispose: () => void): () => void {
+    const connections = this.live.get(deviceId)
+    if (connections === undefined) this.live.set(deviceId, new Set([dispose]))
+    else connections.add(dispose)
     let released = false
     return () => {
       if (released) return
       released = true
-      const rest = (this.live.get(deviceId) ?? 1) - 1
-      if (rest > 0) {
-        this.live.set(deviceId, rest)
-        return
-      }
+      const current = this.live.get(deviceId)
+      if (current === undefined) return
+      current.delete(dispose)
+      if (current.size > 0) return
       this.live.delete(deviceId)
       // The moment it left is the "last seen" a person actually cares about.
       const record = this.devices.get(deviceId)
@@ -181,11 +195,50 @@ export class DeviceRegistry {
     return this.live.has(deviceId)
   }
 
-  /** Revoke one device; its next handshake fails. */
+  /**
+   * Revoke one device: it is removed from the whitelist, and every connection
+   * it already holds is hung up.
+   *
+   * Removing the record alone would leave a revoked phone with full access for
+   * as long as it kept one socket open, which is indefinitely for HTTP.
+   */
   async revoke(deviceId: string): Promise<boolean> {
     if (!this.devices.delete(deviceId)) return false
+    this.disconnect(deviceId)
     await this.save()
     return true
+  }
+
+  /**
+   * Hang up on every connection a device holds, without unwhitelisting it.
+   *
+   * One failing `dispose` must not strand the rest, so each is isolated.
+   * @param deviceId - the device whose connections should end.
+   */
+  private disconnect(deviceId: string): void {
+    const connections = this.live.get(deviceId)
+    if (connections === undefined) return
+    this.live.delete(deviceId)
+    for (const dispose of connections) {
+      try {
+        dispose()
+      } catch {
+        // A connection that cannot be closed is already gone in every way
+        // that matters; the rest still deserve their turn.
+      }
+    }
+  }
+
+  /** Drop and disconnect every device whose TTL has passed. */
+  private async expire(now: number): Promise<void> {
+    let changed = false
+    for (const [deviceId, record] of this.devices) {
+      if (record.expiresAt > now) continue
+      this.devices.delete(deviceId)
+      this.disconnect(deviceId)
+      changed = true
+    }
+    if (changed) await this.save()
   }
 
   private consume(pairingToken: Buffer, now: number): boolean {

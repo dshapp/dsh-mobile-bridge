@@ -17,7 +17,7 @@ import type {} from '@deepseek-ai/dsh-api-gateway/types'
 import { localDeviceName, registerControlApi } from './api.ts'
 import { createMobileServer } from './http.ts'
 import { serveStream } from './session.ts'
-import { DeviceRegistry, encodeKey, loadIdentity } from './store.ts'
+import { DeviceRegistry, loadIdentity } from './store.ts'
 import { ProxyTunnel } from './tunnel.ts'
 
 /** Stable Cordis plugin name. */
@@ -38,6 +38,19 @@ export interface Config {
   deviceTtlDays?: number
   /** Name phones show for this Mac; defaults to the computer's own name. */
   deviceName?: string
+  /**
+   * Extra exact `/api` paths phones may reach, on top of the built-in
+   * allowlist. The RPC channel itself is always open; this only widens the
+   * plugin-registered routes, which are otherwise default-deny.
+   */
+  apiAllowlist?: string[]
+  /**
+   * Milliseconds a new mobile connection may spend on the preamble and the
+   * Noise handshake before it is dropped. A stream that is opened but never
+   * authenticates would otherwise hold one of the proxy's per-bridge slots
+   * forever, which is enough to lock a real phone out.
+   */
+  handshakeTimeoutMs?: number
 }
 
 /**
@@ -50,12 +63,14 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   const proxyPort = config.proxyPort ?? 8787
   const deviceTtlDays = config.deviceTtlDays ?? 180
   const deviceName = (config.deviceName ?? '').trim() || localDeviceName()
+  const handshakeTimeoutMs = config.handshakeTimeoutMs ?? 10_000
 
   const identity = await loadIdentity(ctx.credentials)
   const devices = await DeviceRegistry.load(ctx.credentials, deviceTtlDays)
   const { server, close } = createMobileServer(
     ctx.connection.createSharedFetchHandler('/api'),
     ctx.typertGateway.wireStream,
+    config.apiAllowlist === undefined ? {} : { apiAllowlist: config.apiAllowlist },
   )
 
   const tunnel = new ProxyTunnel({
@@ -64,7 +79,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     identity,
     ...config.proxyPublicKey === undefined ? {} : { proxyPublicKey: Buffer.from(config.proxyPublicKey, 'base64') },
     onStream: (stream) => {
-      void serveStream(stream, { identity, devices, server }).catch((error: unknown) => {
+      void serveStream(stream, { identity, devices, server, handshakeTimeoutMs }).catch((error: unknown) => {
         // A device that fails here gets nothing back; the operator still needs
         // to see why, so this is a warning rather than a silent drop.
         ctx.logger.warn(error)
@@ -81,5 +96,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     }
   }, 'mobile-bridge: proxy tunnel')
   registerControlApi(ctx, { identity, devices, tunnel, proxyHost, proxyPort, deviceName })
-  ctx.logger.info('mobile bridge key %s', encodeKey(identity.publicKey))
+  // The routing key is an identifier, not a secret — but a log is not the
+  // place for it, and the Mac app already gets it from `mobileBridge/status`.
+  ctx.logger.info('mobile bridge ready via %s:%d', proxyHost, proxyPort)
 }

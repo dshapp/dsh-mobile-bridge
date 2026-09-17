@@ -13,9 +13,16 @@ iPhone --bare TCP--> dsh-proxy --mux over Noise_XX--> this plugin --in process--
 - **Authentication is the handshake.** Noise_IK proves the device's static key
   (that key *is* the device id) and proves us to the device. A device that is
   neither whitelisted nor carrying a live pairing token is dropped before any
-  harness traffic is served. No TLS, no certificate, no bearer token.
+  harness traffic is served, and one that stalls mid-handshake is dropped after
+  `handshakeTimeoutMs`. No TLS, no certificate, no bearer token.
+- **A phone reaches only what it needs.** The handshake says *who* is calling;
+  an allowlist decides *what* they may call. Exact plugin routes are
+  default-deny, the RPC channel `/api/<namespace>/<method>` is open, and the
+  bridge's own control plane is refused outright.
 - **The proxy learns nothing.** It reads a 37-byte routing preamble and copies
-  bytes; it cannot decrypt, and it stores nothing on disk.
+  bytes; it cannot decrypt, and it stores nothing on disk. The routing key is
+  an identifier, not a secret — it is in the pairing QR code, so neither side
+  writes it to a log.
 
 See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 
@@ -34,7 +41,12 @@ dsh plugin --profile web add dsh-mobile-bridge
     proxyPort: 8787
     proxyPublicKey: ''     # optional base64 key to pin
     deviceTtlDays: 180
+    handshakeTimeoutMs: 10000   # preamble + Noise_IK deadline
+    apiAllowlist: []       # extra exact /api routes, added to the defaults
 ```
+
+The default allowlist is `/api/file`, `/api/session/uploadFileBinary` and
+`/api/remote.mux`; `apiAllowlist` extends it rather than replacing it.
 
 ## Control API
 
@@ -49,6 +61,12 @@ Three exact routes on the shared channel, for the Mac app:
 Each device carries `online`: the bridge counts the streams a phone actually
 holds, so presence is observed, not guessed from `lastSeenAt` — which is
 refreshed the moment the last of those streams goes away.
+
+These routes are for the Mac app, which reaches them over the authenticated
+localhost web channel. A paired phone is answered `403` on them: `pair` mints
+codes and `revoke` ejects devices, so neither belongs on the phone channel.
+Revoking a device also hangs up on the connections it already holds, rather
+than waiting for it to close them.
 
 `status` answers everything a pairing screen displays and changes nothing:
 the live code disappears from it the moment a phone redeems it or it expires,

@@ -5,7 +5,7 @@
  */
 
 import type { Duplex } from 'node:stream'
-import type { NoiseTransport } from './noise.ts'
+import { NOISE_TAG_LEN, type NoiseTransport } from './noise.ts'
 import {
   FRAME_HEAD,
   KEEPALIVE_MS,
@@ -18,6 +18,19 @@ import {
   WINDOW,
 } from './wire.ts'
 
+const EMPTY = Buffer.alloc(0)
+
+/**
+ * Receive credit is returned in batches.
+ *
+ * Every WINDOW_UPDATE is a whole ChaCha message, so acknowledging each inbound
+ * frame costs a cipher setup per frame and made pure credit accounting 28% of
+ * everything the bridge sent. Batching lets the peer's credit dip at most this
+ * far below the advertised 256 KiB window — far more than the 16 KiB one frame
+ * needs, so it can never stall waiting for credit.
+ */
+const WINDOW_BATCH = WINDOW / 4
+
 /** One logical connection from a phone, riding the bridge link. */
 export class MuxStream {
   private buffered: Buffer[] = []
@@ -28,6 +41,8 @@ export class MuxStream {
   private credit = WINDOW
   private drains: (() => void)[] = []
   private enders: (() => void)[] = []
+  /** Inbound bytes received but not yet acknowledged with a WINDOW_UPDATE. */
+  private unacked = 0
 
   constructor(readonly id: number, private readonly link: MuxLink) {}
 
@@ -74,7 +89,11 @@ export class MuxStream {
     this.buffered.push(chunk)
     this.size += chunk.length
     this.settle()
-    this.link.send(this.id, KIND_WINDOW, windowPayload(chunk.length))
+    this.unacked += chunk.length
+    if (this.unacked < WINDOW_BATCH) return
+    const owed = this.unacked
+    this.unacked = 0
+    this.link.send(this.id, KIND_WINDOW, windowPayload(owed))
   }
 
   /** @internal Grant more send credit. */
@@ -113,12 +132,35 @@ export class MuxStream {
     }
   }
 
+  /**
+   * Take exactly `need` bytes, joining only the chunks that carry them.
+   *
+   * The caller peeks a 2-byte length prefix before every frame, and joining
+   * the whole buffer to do that (up to the full 256 KiB window) copied about
+   * 1.6 bytes for every byte that actually arrived.
+   */
   private take(need: number): Buffer | undefined {
     if (this.size < need) return undefined
-    const joined = this.buffered.length === 1 ? this.buffered[0] as Buffer : Buffer.concat(this.buffered)
-    this.buffered = joined.length > need ? [joined.subarray(need)] : []
-    this.size = joined.length - need
-    return joined.subarray(0, need)
+    if (need === 0) return EMPTY
+    const first = this.buffered[0] as Buffer
+    if (first.length >= need) {
+      this.buffered[0] = first.subarray(need)
+      if (this.buffered[0].length === 0) this.buffered.shift()
+      this.size -= need
+      return first.subarray(0, need)
+    }
+    const joined = Buffer.allocUnsafe(need)
+    let offset = 0
+    while (offset < need) {
+      const chunk = this.buffered[0] as Buffer
+      const used = Math.min(chunk.length, need - offset)
+      chunk.copy(joined, offset, 0, used)
+      offset += used
+      if (used === chunk.length) this.buffered.shift()
+      else this.buffered[0] = chunk.subarray(used)
+    }
+    this.size -= need
+    return joined
   }
 }
 
@@ -132,6 +174,8 @@ function windowPayload(bytes: number): Buffer {
 export class MuxLink {
   private readonly streams = new Map<number, MuxStream>()
   private pending: Buffer = Buffer.alloc(0)
+  /** Reused plaintext frame; send() is synchronous, so one buffer suffices. */
+  private readonly scratch = Buffer.allocUnsafe(FRAME_HEAD + MAX_PAYLOAD)
   private keepalive: NodeJS.Timeout | undefined
   private idle: NodeJS.Timeout | undefined
   private closed = false
@@ -151,18 +195,21 @@ export class MuxLink {
   }
 
   /** Encrypt and write one mux frame. */
-  send(id: number, kind: number, payload: Buffer = Buffer.alloc(0)): void {
+  send(id: number, kind: number, payload: Buffer = EMPTY): void {
     if (this.closed) return
-    const frame = Buffer.alloc(FRAME_HEAD + payload.length)
+    const plainLength = FRAME_HEAD + payload.length
+    const frame = plainLength <= this.scratch.length ? this.scratch : Buffer.allocUnsafe(plainLength)
     frame.writeUInt32BE(id, 0)
     frame.writeUInt8(kind, 4)
     frame.writeUInt16BE(payload.length, 5)
-    payload.copy(frame, FRAME_HEAD)
-    const sealed = this.transport.encrypt(frame)
-    const out = Buffer.alloc(2 + sealed.length)
-    out.writeUInt16BE(sealed.length, 0)
-    sealed.copy(out, 2)
-    this.socket.write(out)
+    frame.writeUInt8(0, 7)
+    if (payload.length > 0) payload.copy(frame, FRAME_HEAD)
+    // Seal straight into the length-prefixed output: one allocation per frame
+    // where encrypt() needed four, and no intermediate copies.
+    const out = Buffer.allocUnsafe(2 + plainLength + NOISE_TAG_LEN)
+    const sealed = this.transport.sealInto(frame.subarray(0, plainLength), out, 2)
+    out.writeUInt16BE(sealed, 0)
+    this.socket.write(out.subarray(0, 2 + sealed))
   }
 
   /** Tear the link down; the tunnel reconnects. */

@@ -14,13 +14,21 @@ import {
   createHmac,
   createPrivateKey,
   createPublicKey,
+  createSecretKey,
   diffieHellman,
   generateKeyPairSync,
+  type KeyObject,
 } from 'node:crypto'
 
 /** X25519 key length, SHA-256 length, Poly1305 tag length. */
 const DHLEN = 32
 const TAGLEN = 16
+
+/** Bytes the Poly1305 tag adds to every sealed message; sizes seal buffers. */
+export const NOISE_TAG_LEN = TAGLEN
+
+/** Reused AAD: Noise transport messages authenticate no associated data. */
+const EMPTY = Buffer.alloc(0)
 
 const PKCS8_PREFIX = Buffer.from('302e020100300506032b656e04220420', 'hex')
 const SPKI_PREFIX = Buffer.from('302a300506032b656e032100', 'hex')
@@ -29,6 +37,14 @@ const SPKI_PREFIX = Buffer.from('302a300506032b656e032100', 'hex')
 export interface KeyPair {
   readonly privateKey: Buffer
   readonly publicKey: Buffer
+  /**
+   * node's own handles for the same keys. Handing a raw Buffer to
+   * `diffieHellman` makes node rebuild and revalidate a KeyObject on every
+   * call (~29us private, ~15us public, 73% of a DH); these carry the handles
+   * wherever they are already at hand, and are memoised when they are not.
+   */
+  readonly privateKeyObject?: KeyObject
+  readonly publicKeyObject?: KeyObject
 }
 
 /** Generate one X25519 static key pair. */
@@ -37,25 +53,42 @@ export function generateKeyPair(): KeyPair {
   return {
     privateKey: Buffer.from(privateKey.export({ format: 'der', type: 'pkcs8' })).subarray(16),
     publicKey: Buffer.from(publicKey.export({ format: 'der', type: 'spki' })).subarray(12),
+    // Generation produced them already, so keeping them is free and spares
+    // the two DHs that use this ephemeral a re-parse of it.
+    privateKeyObject: privateKey,
+    publicKeyObject: publicKey,
   }
 }
 
 /** Derive the public half of a raw private key. */
 export function publicKeyOf(privateKey: Buffer): Buffer {
-  const key = createPublicKey(privateKeyObject(privateKey))
+  const key = createPublicKey(rawPrivateKeyObject(privateKey))
   return Buffer.from(key.export({ format: 'der', type: 'spki' })).subarray(12)
 }
 
-function privateKeyObject(raw: Buffer) {
+/** Parse one raw private key; DER framing is why callers cache the result. */
+function rawPrivateKeyObject(raw: Buffer): KeyObject {
   return createPrivateKey({ key: Buffer.concat([PKCS8_PREFIX, raw]), format: 'der', type: 'pkcs8' })
 }
 
-function publicKeyObject(raw: Buffer) {
+/** Parse one raw public key; DER framing is why callers cache the result. */
+function rawPublicKeyObject(raw: Buffer): KeyObject {
   return createPublicKey({ key: Buffer.concat([SPKI_PREFIX, raw]), format: 'der', type: 'spki' })
 }
 
-function dh(privateKey: Buffer, publicKey: Buffer): Buffer {
-  return diffieHellman({ privateKey: privateKeyObject(privateKey), publicKey: publicKeyObject(publicKey) })
+/** Private KeyObjects by pair, so a long-lived key is parsed once at most. */
+const privateObjects = new WeakMap<KeyPair, KeyObject>()
+
+function privateObject(keyPair: KeyPair): KeyObject {
+  const cached = keyPair.privateKeyObject ?? privateObjects.get(keyPair)
+  if (cached !== undefined) return cached
+  const parsed = rawPrivateKeyObject(keyPair.privateKey)
+  privateObjects.set(keyPair, parsed)
+  return parsed
+}
+
+function dh(privateKey: KeyObject, publicKey: KeyObject): Buffer {
+  return diffieHellman({ privateKey, publicKey })
 }
 
 function sha256(data: Buffer): Buffer {
@@ -77,11 +110,15 @@ function hkdf(chainingKey: Buffer, ikm: Buffer, outputs: 2 | 3): Buffer[] {
 
 /** One directional ChaChaPoly key with its 64-bit nonce counter. */
 class CipherState {
-  private key: Buffer | undefined
+  private readonly key: KeyObject | undefined
   private nonce = 0n
 
   constructor(key?: Buffer) {
-    this.key = key
+    // Handed a raw Buffer, node rebuilds and revalidates a KeyObject inside
+    // every createCipheriv call: ~5.9us of the ~7.5us a message cost, and the
+    // single largest consumer of this process's CPU under load. Building the
+    // KeyObject once drops construction to ~0.6us.
+    this.key = key === undefined ? undefined : createSecretKey(key)
   }
 
   get hasKey(): boolean {
@@ -90,10 +127,24 @@ class CipherState {
 
   encrypt(ad: Buffer, plaintext: Buffer): Buffer {
     if (this.key === undefined) return plaintext
+    const sealed = Buffer.allocUnsafe(plaintext.length + TAGLEN)
+    this.sealInto(ad, plaintext, sealed, 0)
+    return sealed
+  }
+
+  /** Seal `plaintext` into `out` at `offset`; returns the bytes written. */
+  sealInto(ad: Buffer, plaintext: Buffer, out: Buffer, offset: number): number {
+    if (this.key === undefined) {
+      plaintext.copy(out, offset)
+      return plaintext.length
+    }
     const cipher = createCipheriv('chacha20-poly1305', this.key, this.iv(), { authTagLength: TAGLEN })
     cipher.setAAD(ad, { plaintextLength: plaintext.length })
-    const body = Buffer.concat([cipher.update(plaintext), cipher.final()])
-    return Buffer.concat([body, cipher.getAuthTag()])
+    const body = cipher.update(plaintext)
+    body.copy(out, offset)
+    cipher.final()
+    cipher.getAuthTag().copy(out, offset + body.length)
+    return body.length + TAGLEN
   }
 
   decrypt(ad: Buffer, ciphertext: Buffer): Buffer {
@@ -103,7 +154,10 @@ class CipherState {
     const decipher = createDecipheriv('chacha20-poly1305', this.key, this.iv(), { authTagLength: TAGLEN })
     decipher.setAAD(ad, { plaintextLength: body.length })
     decipher.setAuthTag(ciphertext.subarray(ciphertext.length - TAGLEN))
-    return Buffer.concat([decipher.update(body), decipher.final()])
+    const plaintext = Buffer.allocUnsafe(body.length)
+    decipher.update(body).copy(plaintext, 0)
+    decipher.final()
+    return plaintext
   }
 
   private iv(): Buffer {
@@ -119,11 +173,20 @@ export class NoiseTransport {
   constructor(private readonly send: CipherState, private readonly receive: CipherState) {}
 
   encrypt(plaintext: Buffer): Buffer {
-    return this.send.encrypt(Buffer.alloc(0), plaintext)
+    return this.send.encrypt(EMPTY, plaintext)
+  }
+
+  /**
+   * Seal `plaintext` straight into a caller-owned buffer at `offset`.
+   * Returns the bytes written, so a framed writer can reserve its length
+   * prefix up front rather than allocating and copying a sealed buffer.
+   */
+  sealInto(plaintext: Buffer, out: Buffer, offset: number): number {
+    return this.send.sealInto(EMPTY, plaintext, out, offset)
   }
 
   decrypt(ciphertext: Buffer): Buffer {
-    return this.receive.decrypt(Buffer.alloc(0), ciphertext)
+    return this.receive.decrypt(EMPTY, ciphertext)
   }
 }
 
@@ -164,7 +227,9 @@ export class Handshake {
   private cipher = new CipherState()
   private ephemeral: KeyPair | undefined
   private remoteEphemeral: Buffer | undefined
+  private remoteEphemeralObject: KeyObject | undefined
   private remoteStaticKey: Buffer | undefined
+  private remoteStaticObject: KeyObject | undefined
   private index = 0
 
   private readonly pattern: Pattern
@@ -234,12 +299,14 @@ export class Handshake {
       if (token === 'e') {
         if (rest.length < DHLEN) throw new Error('noise: truncated handshake message')
         this.remoteEphemeral = rest.subarray(0, DHLEN)
+        this.remoteEphemeralObject = undefined
         this.mixHash(this.remoteEphemeral)
         rest = rest.subarray(DHLEN)
       } else if (token === 's') {
         const size = this.cipher.hasKey ? DHLEN + TAGLEN : DHLEN
         if (rest.length < size) throw new Error('noise: truncated handshake message')
         this.remoteStaticKey = this.decryptAndHash(rest.subarray(0, size))
+        this.remoteStaticObject = undefined
         rest = rest.subarray(size)
       } else {
         this.mixKey(this.dhFor(token))
@@ -259,23 +326,43 @@ export class Handshake {
       : new NoiseTransport(new CipherState(second), new CipherState(first))
   }
 
+  /** The peer's ephemeral public key as a KeyObject, parsed at most once. */
+  private remoteEphemeralKey(): KeyObject | undefined {
+    if (this.remoteEphemeral === undefined) return undefined
+    this.remoteEphemeralObject ??= rawPublicKeyObject(this.remoteEphemeral)
+    return this.remoteEphemeralObject
+  }
+
+  /** The peer's static public key as a KeyObject, parsed at most once. */
+  private remoteStaticKeyObject(): KeyObject | undefined {
+    if (this.remoteStaticKey === undefined) return undefined
+    this.remoteStaticObject ??= rawPublicKeyObject(this.remoteStaticKey)
+    return this.remoteStaticObject
+  }
+
   private dhFor(token: Token): Buffer {
     const local = this.initiator
     const e = this.ephemeral
-    const re = this.remoteEphemeral
-    const rs = this.remoteStaticKey
+    // Each of these two handles is used by two tokens, so parsing it here
+    // instead of inside dh() halves the DER work of a handshake.
+    const re = this.remoteEphemeralKey()
+    const rs = this.remoteStaticKeyObject()
     const missing = (): never => { throw new Error(`noise: token ${token} has no key material`) }
     switch (token) {
       case 'ee':
-        return e && re ? dh(e.privateKey, re) : missing()
+        return e && re ? dh(privateObject(e), re) : missing()
       case 'ss':
-        return rs ? dh(this.staticKey.privateKey, rs) : missing()
+        return rs ? dh(privateObject(this.staticKey), rs) : missing()
       case 'es':
         // "es" is always initiator-ephemeral with responder-static.
-        return local ? (e && rs ? dh(e.privateKey, rs) : missing()) : (re ? dh(this.staticKey.privateKey, re) : missing())
+        return local
+          ? (e && rs ? dh(privateObject(e), rs) : missing())
+          : (re ? dh(privateObject(this.staticKey), re) : missing())
       case 'se':
         // "se" is always initiator-static with responder-ephemeral.
-        return local ? (re ? dh(this.staticKey.privateKey, re) : missing()) : (e && rs ? dh(e.privateKey, rs) : missing())
+        return local
+          ? (re ? dh(privateObject(this.staticKey), re) : missing())
+          : (e && rs ? dh(privateObject(e), rs) : missing())
       default:
         return missing()
     }
