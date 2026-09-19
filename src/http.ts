@@ -16,6 +16,8 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
 import { Readable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
+import { createGzip } from 'node:zlib'
 import type { ConnectionFetchHandler } from '@deepseek-ai/dsh-client-connection'
 import type { TypertGatewayWireStream } from '@deepseek-ai/dsh-api-gateway/types'
 import { WebSocketServer, type WebSocket } from 'ws'
@@ -35,13 +37,21 @@ const CONTROL_API_PREFIX = '/api/mobileBridge/'
 /**
  * Exact routes a phone may call. Plugin-registered routes are side doors that
  * bypass the RPC envelope, so they are default-deny and listed one by one:
- * media and attachment reads, the binary upload the phone composer uses, and
- * the Gateway's Remote-stream socket.
+ * media and attachment reads, the binary upload the phone composer uses, the
+ * Gateway's Remote-stream socket, and the two read-only routes behind a turn's
+ * changed-files card.
+ *
+ * The change routes are `GET` with two segments (`changes.summary`), so neither
+ * the RPC rule (POST + JSON, exactly one segment) nor a wildcard would admit
+ * them; they carry no arguments beyond their query and are reads only, which is
+ * why they can be listed here as exact paths rather than kept behind a verb.
  */
 const DEFAULT_API_ALLOWLIST: readonly string[] = [
   '/api/file',
   '/api/session/uploadFileBinary',
   '/api/remote.mux',
+  '/api/changes.summary',
+  '/api/changes.diff',
 ]
 
 /** One RPC endpoint segment, matching the harness's own grammar. */
@@ -96,6 +106,153 @@ function isJson(contentType: string | undefined): boolean {
   return contentType?.split(';', 1)[0]?.trim().toLowerCase() === 'application/json'
 }
 
+/**
+ * A compressed body below this size costs more header than it saves.
+ *
+ * Only applied when the upstream named a `content-length`; a streamed body has
+ * no length to judge and is compressed on its content type alone.
+ */
+const MIN_GZIP_BYTES = 512
+
+/**
+ * Whether one `accept-encoding` header admits gzip.
+ *
+ * `gzip` beats `*` when both appear, and a `q=0` on either forbids it — the
+ * phone sends a bare `gzip`, so this exists for correctness rather than for
+ * any client the bridge has today.
+ * @param acceptEncoding - the raw request header, if any.
+ * @returns whether gzip may be used.
+ */
+function acceptsGzip(acceptEncoding: string | undefined): boolean {
+  if (acceptEncoding === undefined) return false
+  let gzip = -1
+  let star = -1
+  for (const part of acceptEncoding.split(',')) {
+    const [rawName, ...params] = part.split(';')
+    const name = rawName?.trim().toLowerCase()
+    if (name !== 'gzip' && name !== '*') continue
+    let quality = 1
+    for (const param of params) {
+      const match = /^\s*q\s*=\s*([0-9.]+)\s*$/i.exec(param)
+      if (match !== null) quality = Number(match[1])
+    }
+    if (name === 'gzip') gzip = quality
+    else star = quality
+  }
+  return (gzip >= 0 ? gzip : star) > 0
+}
+
+/**
+ * Whether a body is worth deflating.
+ *
+ * Only text and JSON qualify: a Noise tunnel already pays the frame cost once,
+ * and gzipping an attachment or an image spends CPU to make it larger. The
+ * match is deliberately positive — an unknown content type is left alone.
+ * @param contentType - raw `content-type` from the upstream response.
+ * @returns whether gzip should be tried.
+ */
+function isCompressible(contentType: string | undefined): boolean {
+  if (contentType === undefined) return false
+  const mime = contentType.split(';', 1)[0]?.trim().toLowerCase() ?? ''
+  if (mime.startsWith('text/')) return true
+  return mime === 'application/json' ||
+    mime === 'application/xml' ||
+    mime === 'application/javascript' ||
+    mime === 'image/svg+xml' ||
+    mime.endsWith('+json') ||
+    mime.endsWith('+xml')
+}
+
+/**
+ * Whether the upstream already declared this body small enough to skip.
+ * @param contentLength - raw `content-length` from the upstream response.
+ * @returns whether the body is known to be below {@link MIN_GZIP_BYTES}.
+ */
+function isNegligiblySmall(contentLength: string | null): boolean {
+  if (contentLength === null) return false
+  const size = Number(contentLength)
+  return Number.isFinite(size) && size >= 0 && size < MIN_GZIP_BYTES
+}
+
+/** The one RPC whose rows carry a projection block a phone may ask to trim. */
+const SESSION_LIST_PATH = '/api/session/list'
+
+/**
+ * The projection keys one caller asked this list to keep, or `null` for "all".
+ *
+ * A phone's list screen only draws a couple of keys, but a list row's projection
+ * block is by far the largest part of the response (every key any panel might
+ * need, for every Session). The host ignores unknown request fields, so the
+ * caller declares what it reads as `_request.projections` and the bridge honours
+ * it here; the host stays authoritative and a caller that says nothing keeps
+ * today's full list. An empty declaration is meaningless, so it is treated as
+ * "all" rather than "none".
+ * @param pathname - request path, already URL-normalized.
+ * @param method - HTTP method, upper case.
+ * @param body - the request body when it was buffered, if any.
+ * @returns the declared keys, or `null` to forward the response untouched.
+ */
+function requestedProjections(pathname: string, method: string, body: Buffer | null): string[] | null {
+  if (pathname !== SESSION_LIST_PATH || method !== 'POST' || body === null || body.length === 0) return null
+  try {
+    const parsed: unknown = JSON.parse(body.toString('utf8'))
+    const request = record(record(record(parsed)?.payload)?.args)?._request
+    const declared = record(request)?.projections
+    if (!Array.isArray(declared) || declared.length === 0) return null
+    const keys = declared.filter((key): key is string => typeof key === 'string' && key.length > 0)
+    return keys.length === 0 ? null : keys
+  } catch {
+    return null
+  }
+}
+
+/** Narrow an unknown JSON value to a plain object. */
+function record(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+}
+
+/**
+ * Keep only the declared projection keys on every row of one `session/list`
+ * response, preserving the envelope byte-for-byte otherwise.
+ *
+ * The body is buffered to rewrite it, so a response that is not the expected
+ * JSON is forwarded unchanged; a failure can only make this a no-op, never a
+ * broken reply.
+ * @param response - the upstream Fetch response.
+ * @param keys - projection keys to keep.
+ * @returns a response carrying the trimmed list.
+ */
+async function trimListProjections(response: Response, keys: readonly string[]): Promise<Response> {
+  const bytes = new Uint8Array(await response.arrayBuffer())
+  const headers = new Headers(response.headers)
+  deleteContentLength(headers)
+  let body: string = ''
+  try {
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes))
+    const items = record(record(record(parsed)?.result)?.value)?.items
+    if (!Array.isArray(items)) return new Response(bytes, { status: response.status, headers })
+    for (const item of items) {
+      const block = record(record(item)?.projections)
+      const values = record(block?.values)
+      if (block === null || values === null) continue
+      const kept: Record<string, unknown> = {}
+      for (const key of keys) if (Object.hasOwn(values, key)) kept[key] = values[key]
+      block.values = kept
+    }
+    body = JSON.stringify(parsed)
+  } catch {
+    return new Response(bytes, { status: response.status, headers })
+  }
+  return new Response(body, { status: response.status, headers })
+}
+
+/** Drop a now-stale framing header; a rewritten body computes its own length. */
+function deleteContentLength(headers: Headers): void {
+  headers.delete('content-length')
+}
+
 /** Build the port-less HTTP server that mobile connections are fed into. */
 export function createMobileServer(
   api: ConnectionFetchHandler,
@@ -106,7 +263,10 @@ export function createMobileServer(
     ...DEFAULT_API_ALLOWLIST,
     ...options.apiAllowlist ?? [],
   ])
-  const sockets = new WebSocketServer({ noServer: true })
+  // OkHttp (the phone's client) offers `permessage-deflate` on every upgrade,
+  // so this costs one negotiating header and turns the mux's JSON into deflate
+  // frames. The threshold keeps small projection frames off the zlib path.
+  const sockets = new WebSocketServer({ noServer: true, perMessageDeflate: { threshold: 256 } })
   const server = createServer((req, res) => {
     void serve(req, res, api, allowlist).catch(() => { res.destroy() })
   })
@@ -168,6 +328,9 @@ async function serve(
     Object.entries(req.headers).filter(([, value]) => typeof value === 'string') as [string, string][],
   )
   const mode = api.requestBodyMode({ method, url })
+  // A declared projection allowlist only exists on a buffered body; a streamed
+  // request cannot be inspected without consuming it, so it forwards as today.
+  let listKeys: string[] | null = null
   let request: Request
   if (mode === 'buffered') {
     const chunks: Buffer[] = []
@@ -182,10 +345,12 @@ async function serve(
       }
       chunks.push(chunk as Buffer)
     }
+    const body = chunks.length > 0 ? Buffer.concat(chunks) : null
+    listKeys = requestedProjections(url.pathname, method, body)
     request = new Request(url, {
       method,
       headers,
-      ...chunks.length > 0 ? { body: Buffer.concat(chunks) } : {},
+      ...body === null ? {} : { body },
       signal: abort.signal,
     })
   } else {
@@ -197,10 +362,37 @@ async function serve(
       duplex: 'half',
     } as RequestInit & { duplex: 'half' })
   }
-  const response = await api.fetch(request)
-  res.writeHead(response.status, Object.fromEntries(response.headers.entries()))
+  const upstream = await api.fetch(request)
+  // Honour a caller-declared projection allowlist before compressing: the
+  // trimmed JSON is what the relay carries, and the host kept its full copy.
+  const response = listKeys === null ? upstream : await trimListProjections(upstream, listKeys)
+  const responseHeaders = new Headers(response.headers)
+  // Compress before writing any header: the compressed length is unknown, so
+  // `content-length` has to go and the framing becomes chunked. The web
+  // carrier gzips these same responses; a phone used to be handed them raw.
+  const gzip = response.body !== null &&
+    method !== 'HEAD' &&
+    !responseHeaders.has('content-encoding') &&
+    acceptsGzip(req.headers['accept-encoding']) &&
+    isCompressible(responseHeaders.get('content-type') ?? undefined) &&
+    !isNegligiblySmall(responseHeaders.get('content-length'))
+  if (gzip) {
+    responseHeaders.delete('content-length')
+    responseHeaders.set('content-encoding', 'gzip')
+    const vary = responseHeaders.get('vary')
+    responseHeaders.set('vary', vary === null ? 'accept-encoding' : `${vary}, accept-encoding`)
+  }
+  res.writeHead(response.status, Object.fromEntries(responseHeaders.entries()))
   if (response.body === null) {
     res.end()
+    return
+  }
+  if (gzip) {
+    await pipeline(
+      Readable.fromWeb(response.body as import('node:stream/web').ReadableStream<Uint8Array>),
+      createGzip(),
+      res,
+    ).catch(() => { res.destroy() })
     return
   }
   for await (const chunk of response.body) {

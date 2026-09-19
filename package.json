@@ -1,6 +1,6 @@
 {
   "name": "dsh-mobile-bridge",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "DeepSeek Harness (DSH) bundle: serves the harness API to paired mobile devices over a Noise-encrypted tunnel, without opening a port.",
   "type": "module",
   "license": "MIT",
@@ -65,6 +65,7 @@
     "build": "tsdown",
     "prepare": "tsdown",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "check": "npm run typecheck && npm run build"
+    "check": "npm run typecheck && npm run build",
+    "test": "node --experimental-strip-types test/allowlist.test.ts"
   }
 }

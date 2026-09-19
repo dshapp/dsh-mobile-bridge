@@ -69,7 +69,16 @@ keep-alive and `Upgrade` work unchanged. An authenticated device may reach:
 - `POST /api/<namespace>/<method>` — the shared Fetch channel (harness RPC
   envelope), with a JSON content type.
 - The exact routes on the bridge's allowlist — `/api/file`,
-  `/api/session/uploadFileBinary` and `/api/remote.mux` by default.
+  `/api/session/uploadFileBinary`, `/api/remote.mux`, `/api/changes.summary` and
+  `/api/changes.diff` by default. The `changes.*` pair are `GET` reads, so the
+  RPC rule below cannot admit them and they are listed one by one.
+
+Two response-side optimisations ride the same channel, neither of which a phone
+has to ask for: a compressible body is gzipped when the request says
+`accept-encoding: gzip`, and a `session/list` request may declare
+`_request.projections` to trim each row's projection block to the keys it reads
+(the host keeps its full copy; a request that says nothing is forwarded
+untouched).
 
 Everything else answers 404. The bridge's own control plane under
 `/api/mobileBridge/` answers 403 to a phone, even though its paths have the

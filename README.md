@@ -45,8 +45,11 @@ dsh plugin --profile web add dsh-mobile-bridge
     apiAllowlist: []       # extra exact /api routes, added to the defaults
 ```
 
-The default allowlist is `/api/file`, `/api/session/uploadFileBinary` and
-`/api/remote.mux`; `apiAllowlist` extends it rather than replacing it.
+The default allowlist is `/api/file`, `/api/session/uploadFileBinary`,
+`/api/remote.mux`, `/api/changes.summary` and `/api/changes.diff`;
+`apiAllowlist` extends it rather than replacing it. The two `changes.*` entries
+are readings behind a turn's changed-files card — `GET`, so the RPC rule
+(`POST` + JSON) would not admit them.
 
 ## Control API
 
