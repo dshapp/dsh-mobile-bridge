@@ -1,6 +1,6 @@
 {
   "name": "dsh-mobile-bridge",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "DeepSeek Harness (DSH) bundle: serves the harness API to paired mobile devices over a Noise-encrypted tunnel, without opening a port.",
   "type": "module",
   "license": "MIT",
