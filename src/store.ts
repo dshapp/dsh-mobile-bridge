@@ -17,6 +17,8 @@ const DEVICES_KEY = 'mobile-bridge/devices' as CredentialKey
 const PAIRING_TTL_MS = 5 * 60 * 1000
 /** Do not rewrite the store for every request; lastSeen is a coarse fact. */
 const TOUCH_INTERVAL_MS = 60 * 1000
+/** Ceiling on a display label, so one rename cannot bloat the whitelist file. */
+const MAX_LABEL_LENGTH = 64
 
 /** A one-shot pairing code and the moment it stops working. */
 export interface Pairing {
@@ -205,6 +207,26 @@ export class DeviceRegistry {
   async revoke(deviceId: string): Promise<boolean> {
     if (!this.devices.delete(deviceId)) return false
     this.disconnect(deviceId)
+    await this.save()
+    return true
+  }
+
+  /**
+   * Set the display label of one paired device.
+   *
+   * The label is presentation only: it is what a management screen shows, and
+   * nothing in authorization reads it. A blank one is refused rather than
+   * stored, so the whitelist never carries a nameless row.
+   * @param deviceId - the device to relabel.
+   * @param label - the new name; trimmed, and capped at {@link MAX_LABEL_LENGTH}.
+   * @returns whether a device with that id was relabelled.
+   */
+  async rename(deviceId: string, label: string): Promise<boolean> {
+    const record = this.devices.get(deviceId)
+    const trimmed = label.trim().slice(0, MAX_LABEL_LENGTH)
+    if (record === undefined || trimmed === '') return false
+    if (trimmed === record.label) return true
+    record.label = trimmed
     await this.save()
     return true
   }

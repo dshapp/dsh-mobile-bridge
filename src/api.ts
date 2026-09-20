@@ -1,13 +1,15 @@
 /**
- * The Mac app's control surface: three exact routes on the shared `/api`
- * channel, answering the same envelope every other harness endpoint does. The
- * app therefore needs no new transport — and the bridge needs no port, no
- * control socket and no state file of its own.
+ * The Mac app's control surface: exact routes on the shared `/api` channel,
+ * answering the same envelope every other harness endpoint does. The app
+ * therefore needs no new transport — and the bridge needs no port, no control
+ * socket and no state file of its own.
  *
- * These are *control* routes, not phone routes: `pair` mints a pairing code
- * and `revoke` ejects a device. The mobile server refuses `/api/mobileBridge/*`
- * to phones (see http.ts), so the only way in is the app's authenticated
- * localhost web channel. Phones are meant to reach the RPC channel, never this.
+ * These are *control* routes, not phone routes: `pair` mints a pairing code,
+ * `revoke` ejects a device, `rename` relabels one, and
+ * `disconnect`/`connect` cut and restore the relay link itself. The mobile
+ * server refuses `/api/mobileBridge/*` to phones
+ * (see http.ts), so the only way in is the app's authenticated localhost web
+ * channel. Phones are meant to reach the RPC channel, never this.
  */
 
 import { execFileSync } from 'node:child_process'
@@ -28,7 +30,7 @@ export interface ControlDeps {
   readonly deviceName: string
 }
 
-/** Register status / pair / revoke under `/api/mobileBridge`. */
+/** Register status / pair / revoke / rename / disconnect / connect under `/api/mobileBridge`. */
 export function registerControlApi(ctx: Context, deps: ControlDeps): void {
   route(ctx, 'status', () => status(deps))
   route(ctx, 'pair', () => ({
@@ -38,6 +40,23 @@ export function registerControlApi(ctx: Context, deps: ControlDeps): void {
   route(ctx, 'revoke', async (args) => {
     const deviceId = typeof args.deviceId === 'string' ? args.deviceId : ''
     return { removed: await deps.devices.revoke(deviceId) }
+  })
+  // A paired device's label is the operator's, not the bridge's: pairing seeds
+  // a placeholder from the device key and this is how it becomes a real name.
+  route(ctx, 'rename', async (args) => {
+    const deviceId = typeof args.deviceId === 'string' ? args.deviceId : ''
+    const label = typeof args.label === 'string' ? args.label : ''
+    return { renamed: await deps.devices.rename(deviceId, label) }
+  })
+  // Cut and restore the relay link. Cutting hangs up every phone that is on it,
+  // so it is the bridge's own act, not a client-side "hide the QR code".
+  route(ctx, 'disconnect', () => {
+    deps.tunnel.suspend()
+    return { connected: deps.tunnel.connected }
+  })
+  route(ctx, 'connect', () => {
+    deps.tunnel.resume()
+    return { connected: deps.tunnel.connected }
   })
 }
 
@@ -54,6 +73,9 @@ function status(deps: ControlDeps): Record<string, unknown> {
     proxyHost: deps.proxyHost,
     proxyPort: deps.proxyPort,
     connected: deps.tunnel.connected,
+    // Whether the operator cut mobile access. `connected` alone cannot say:
+    // it is also false while the link is merely waiting to come up.
+    disabled: deps.tunnel.isPaused,
     deviceName: deps.deviceName,
     now: Date.now(),
     pairing: pairing === null ? null : pairingView(deps, pairing),
@@ -73,7 +95,7 @@ function status(deps: ControlDeps): Record<string, unknown> {
  * rides along — the only moment a phone can learn it — and becomes the default
  * label of the pairing there.
  */
-function pairingView(deps: ControlDeps, pairing: Pairing): { url: string, expiresAt: number } {
+export function pairingView(deps: ControlDeps, pairing: Pairing): { url: string, expiresAt: number } {
   const key = encodeKey(deps.identity.publicKey)
   const name = deps.deviceName === '' ? '' : `?name=${encodeURIComponent(deps.deviceName)}`
   return {

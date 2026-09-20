@@ -15,6 +15,7 @@ import type {} from '@deepseek-ai/dsh-client-connection'
 import type {} from '@deepseek-ai/dsh-credentials'
 import type {} from '@deepseek-ai/dsh-api-gateway/types'
 import { localDeviceName, registerControlApi } from './api.ts'
+import { registerControlPage } from './web.ts'
 import { createMobileServer } from './http.ts'
 import { serveStream } from './session.ts'
 import { DeviceRegistry, loadIdentity } from './store.ts'
@@ -95,7 +96,10 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       await close()
     }
   }, 'mobile-bridge: proxy tunnel')
-  registerControlApi(ctx, { identity, devices, tunnel, proxyHost, proxyPort, deviceName })
+  const control = { identity, devices, tunnel, proxyHost, proxyPort, deviceName }
+  registerControlApi(ctx, control)
+  // The same screen in a browser, when this composition serves one.
+  registerControlPage(ctx, control)
   // The routing key is an identifier, not a secret — but a log is not the
   // place for it, and the Mac app already gets it from `mobileBridge/status`.
   ctx.logger.info('mobile bridge ready via %s:%d', proxyHost, proxyPort)

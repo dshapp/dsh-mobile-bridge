@@ -82,8 +82,8 @@ untouched).
 
 Everything else answers 404. The bridge's own control plane under
 `/api/mobileBridge/` answers 403 to a phone, even though its paths have the
-RPC shape: those routes mint pairing codes and revoke devices, and belong to
-the Mac app's authenticated localhost channel.
+RPC shape: those routes mint pairing codes, revoke devices, relabel them and
+cut the relay link, and belong to the Mac app's authenticated localhost channel.
 
 ## 5. Pairing
 
