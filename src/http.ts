@@ -43,6 +43,32 @@ const MAX_REQUEST_BODY_BYTES = 300 * 1024 * 1024
  */
 const CONTROL_API_PREFIX = '/api/mobileBridge/'
 
+/** The only origin a mobile request may name. */
+const MOBILE_ORIGIN = 'http://mobile.dsh'
+
+/**
+ * Parse a request target, refusing one that carries an authority of its own.
+ *
+ * A target beginning `//` is a protocol-relative URL, so
+ * `new URL('//elsewhere/api/session/list', MOBILE_ORIGIN)` yields an
+ * allowlisted *pathname* under a host the caller chose. Classifying on the
+ * pathname and then fetching the whole URL would hand that host straight to
+ * the shared handler. Nothing legitimate names an authority here, so this
+ * refuses rather than rewrites: a silent repair hides the attempt.
+ *
+ * @param target - the raw request target, as it arrived.
+ * @returns the URL, or null when the caller named an origin.
+ */
+export function parseMobileUrl(target: string): URL | null {
+  let url: URL
+  try {
+    url = new URL(target, MOBILE_ORIGIN)
+  } catch {
+    return null
+  }
+  return url.origin === MOBILE_ORIGIN ? url : null
+}
+
 /**
  * Exact routes a phone may call. Plugin-registered routes are side doors that
  * bypass the RPC envelope, so they are default-deny and listed one by one:
@@ -284,7 +310,12 @@ export function createMobileServer(
   // is the whole point of keeping it.
   const rpcSessions = new SessionStore()
   server.on('upgrade', (req, socket, head) => {
-    const path = new URL(req.url ?? '/', 'http://mobile.dsh').pathname
+    const target = parseMobileUrl(req.url ?? '/')
+    if (target === null) {
+      socket.destroy()
+      return
+    }
+    const path = target.pathname
     // A WebSocket is not an RPC call: only the exact socket routes, and only
     // when the operator has not removed them from the allowlist.
     const known = path === REMOTE_STREAM_MUX_PATH || path === RPC_MUX_PATH
@@ -324,7 +355,13 @@ async function serve(
   api: ConnectionFetchHandler,
   allowlist: ReadonlySet<string>,
 ): Promise<void> {
-  const url = new URL(req.url ?? '/', 'http://mobile.dsh')
+  const url = parseMobileUrl(req.url ?? '/')
+  if (url === null) {
+    res.writeHead(404)
+    res.end()
+    req.resume()
+    return
+  }
   const verdict = classifyApiRequest(url.pathname, req.method ?? 'GET', req.headers['content-type'], allowlist)
   if (verdict !== 'allow') {
     // `control` is a deliberate refusal, not a missing page: keep it distinct

@@ -111,6 +111,23 @@ const third = await client.request({
 });
 say('bulk beyond one window', { status: third.status, sentBytes: big.length });
 
+// --- can a path smuggle past the allowlist? -------------------------------
+
+// `new URL('//evil.com/api/session/list', 'http://mobile.dsh')` parses
+// evil.com as the HOST, leaving an allowlisted pathname behind. If the
+// bridge classifies on the pathname but fetches the whole URL, the origin
+// has been chosen by the caller.
+const smuggled = await client.request({
+  method: 'POST',
+  path: '//evil.example/api/session/list',
+  headers: { 'content-type': 'application/json' },
+  body: new TextEncoder().encode('{}'),
+});
+say('path smuggling probe', {
+  status: smuggled.status,
+  body: new TextDecoder().decode(smuggled.body).slice(0, 200),
+});
+
 // --- the pairing rules, over the same live chain --------------------------
 
 /** Dial again, so the one-shot pairing token's fate can be observed. */

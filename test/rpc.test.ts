@@ -9,6 +9,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { parseMobileUrl } from '../src/http.ts'
 import { dispatchCall, isCall, SessionStore, type RpcReply } from '../src/rpc.ts'
 
 const results: string[] = []
@@ -110,6 +111,26 @@ await test('malformed frames are rejected', () => {
   assert.equal(isCall(null), false)
 })
 
+
+await test('a request target naming its own origin is refused', () => {
+  // `//elsewhere/api/session/list` parses as host=elsewhere with an
+  // allowlisted pathname. Classifying on the pathname and fetching the whole
+  // URL would let a caller choose the origin.
+  assert.equal(parseMobileUrl('//elsewhere/api/session/list'), null)
+  assert.equal(parseMobileUrl('https://elsewhere/api/session/list'), null)
+  assert.equal(parseMobileUrl('//user:pw@elsewhere/api/session/list'), null)
+  assert.equal(parseMobileUrl('/api/session/list')?.pathname, '/api/session/list')
+  assert.equal(parseMobileUrl('http://mobile.dsh/api/session/list')?.pathname, '/api/session/list')
+})
+
+await test('a smuggled origin never reaches the handler', async () => {
+  const { api, seen } = recordingApi()
+  const reply = await dispatchCall(
+    { t: 'call', id: 1, path: '//elsewhere/api/session/list', body: {} }, api, allowlist)
+  assert.equal(reply.status, 404)
+  assert.deepEqual(seen, [], 'the handler must not be reached at all')
+})
+
 // ------------------------------------------------------------------ sessions
 
 function reply(id: number, body: unknown = { ok: true }): RpcReply {
@@ -165,6 +186,14 @@ await test('reply history is bounded, dropping the oldest first', () => {
   assert.ok(kept.length < 40, 'history must be trimmed')
   assert.equal(kept.at(-1)?.id, 40, 'the newest reply is always kept')
   assert.ok((kept[0]?.id ?? 0) > 1, 'the oldest replies are the ones dropped')
+})
+
+await test('the session store is bounded', () => {
+  const store = new SessionStore()
+  const first = store.open()
+  for (let i = 0; i < 200; i += 1) store.open()
+  assert.ok(store.size <= 64, 'sessions held: ' + String(store.size))
+  assert.equal(store.resume(first), null, 'the oldest session is evicted first')
 })
 
 await test('session ids are unguessable and distinct', () => {

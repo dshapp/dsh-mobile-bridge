@@ -39,7 +39,7 @@ const api: any = {
     const url = new URL(request.url)
     const text = await request.text()
     return new Response(
-      JSON.stringify({ echoed: url.pathname, body: text.length === 0 ? null : JSON.parse(text) }),
+      JSON.stringify({ reachedHandler: request.url, pathname: url.pathname, host: url.host }),
       { status: 200, headers: { 'content-type': 'application/json' } },
     )
   },

@@ -21,7 +21,7 @@
 import { randomBytes } from 'node:crypto'
 import type { ConnectionFetchHandler } from '@deepseek-ai/dsh-client-connection'
 import type { WebSocket } from 'ws'
-import { classifyApiRequest } from './http.ts'
+import { classifyApiRequest, parseMobileUrl } from './http.ts'
 
 /** A call the client asked for. */
 export interface RpcCall {
@@ -55,6 +55,15 @@ interface Session {
 const MAX_SESSION_BYTES = 4 * 1024 * 1024
 /** How long a disconnected session stays resumable. */
 const SESSION_TTL_MS = 10 * 60 * 1000
+/**
+ * Sessions held at once.
+ *
+ * Only paired devices reach this, but a paired device is still a device: one
+ * that opens pipes in a loop would otherwise grow the store until the TTL
+ * caught up. A phone needs one session, so this is many times what honest use
+ * asks for, and the oldest goes first.
+ */
+const MAX_SESSIONS = 64
 
 /**
  * Per-session reply history.
@@ -84,6 +93,12 @@ export class SessionStore {
   /** Mint a new session and return its id. */
   open(): string {
     this.#expire()
+    // Insertion order is age order, so the first key is the oldest session.
+    while (this.#sessions.size >= MAX_SESSIONS) {
+      const oldest = this.#sessions.keys().next()
+      if (oldest.done === true) break
+      this.#sessions.delete(oldest.value)
+    }
     const id = randomBytes(32).toString('base64url')
     this.#sessions.set(id, { replies: [], inflight: new Map(), bytes: 0, lastSeen: this.#now() })
     return id
@@ -178,7 +193,11 @@ export async function dispatchCall(
   api: ConnectionFetchHandler,
   allowlist: ReadonlySet<string>,
 ): Promise<RpcReply> {
-  const url = new URL(call.path, 'http://mobile.dsh')
+  const url = parseMobileUrl(call.path)
+  if (url === null) {
+    // The caller named an origin of its own; see parseMobileUrl.
+    return { t: 'reply', id: call.id, status: 404, body: { error: 'refused' } }
+  }
   const verdict = classifyApiRequest(url.pathname, 'POST', 'application/json', allowlist)
   if (verdict !== 'allow') {
     return {
