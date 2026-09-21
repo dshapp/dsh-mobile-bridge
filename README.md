@@ -96,18 +96,18 @@ The plugin ships the same screen as a browser page, so mobile access does not
 require the Mac app:
 
 ```
-http://127.0.0.1:3080/mobile
+http://127.0.0.1:3080/mobileaccess
 ```
 
 It covers the whole control surface — relay state with cut and restore, the
 paired phones with presence, rename and revoke, and the pairing code — and it
 is the plugin's own asset: one self-contained document (inline style and
 script, no CDN, no separate build), talking to the routes above on the same
-origin. The pairing code is drawn server-side at `/mobile/qr`; the QR encoder
+origin. The pairing code is drawn server-side at `/mobileaccess/qr`; the QR encoder
 is bundled, so the bridge still has no runtime dependency of its own.
 
 Both routes sit behind the ordinary browser fence (`requestRejection`), so
-opening the harness once with the URL `dsh web` prints is what makes `/mobile`
+opening the harness once with the URL `dsh web` prints is what makes `/mobileaccess`
 reachable; a phone cannot reach it at all. The URL is announced on the console
 at startup next to `dsh web:`. In a composition with no web server the page
 does not exist and the tunnel is unaffected.

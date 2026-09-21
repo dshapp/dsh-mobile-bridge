@@ -3,8 +3,8 @@
  * shows, served by the plugin itself.
  *
  * Two exact routes on the composition's `webServer`, both behind the harness's
- * ordinary browser fence (`connection.requestRejection`): `/mobile` is the
- * page, `/mobile/qr` is the live pairing code as SVG. Nothing new is
+ * ordinary browser fence (`connection.requestRejection`): `/mobileaccess` is
+ * the page, `/mobileaccess/qr` is the live pairing code as SVG. Nothing new is
  * authenticated — a browser that may open the harness may open this, and a
  * phone cannot reach either, because the mobile server refuses everything
  * outside its allowlist and the tunnel terminates before this carrier.
@@ -25,9 +25,9 @@ import qrcode from 'qrcode-generator'
 import { pairingView, type ControlDeps } from './api.ts'
 
 /** The page itself. */
-export const PAGE_PATH = '/mobile'
+export const PAGE_PATH = '/mobileaccess'
 /** The pairing QR, live: whatever the bridge currently offers, or 404. */
-export const QR_PATH = '/mobile/qr'
+export const QR_PATH = `${PAGE_PATH}/qr`
 
 /**
  * Serve the Mobile Access page for as long as a web server exists.
@@ -122,8 +122,10 @@ function methodNotAllowed(req: IncomingMessage, res: ServerResponse): void {
  * paired phones with rename and revoke, and the pairing code — and it renders
  * only from `/api/mobileBridge/status`, the same read the Mac app polls.
  *
- * Everything here is deliberately plain: a classic script, string
- * concatenation, and no template literals, so the source stays one literal.
+ * Everything here is deliberately plain: a classic script and string
+ * concatenation, so the page's own code stays one literal. The single
+ * interpolation is `QR_PATH`, so the image URL cannot drift from the route
+ * that serves it.
  */
 const PAGE_HTML = `<!doctype html>
 <html lang="en">
@@ -164,6 +166,7 @@ h2 { font-size: 13px; font-weight: 600; margin: 0; }
 .label .addr { color: var(--secondary); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 .value { display: flex; align-items: center; gap: 12px; flex: none; }
 .status { display: inline-flex; align-items: center; gap: 7px; }
+.status button { font-size: 12px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--secondary); flex: none; }
 .dot.done { background: var(--done); }
 .dot.warning { background: var(--warn); }
@@ -207,8 +210,7 @@ dialog .buttons .primary { font-weight: 600; }
         <div class="addr" id="relay-addr"></div>
       </div>
       <div class="value">
-        <span class="status"><span class="dot" id="relay-dot"></span><span id="relay-text"></span></span>
-        <button id="relay-action" class="danger" hidden></button>
+        <span class="status"><span class="dot" id="relay-dot"></span><span id="relay-text"></span><button id="relay-action" class="danger" hidden></button></span>
       </div>
     </div>
   </section>
@@ -258,13 +260,13 @@ dialog .buttons .primary { font-weight: 600; }
   var EN = {
     title: 'Mobile Access', relay: 'Relay', relayUp: 'Relay connected',
     relayDown: 'Relay disconnected', relayCut: 'Mobile access cut off',
-    disconnect: 'Cut Mobile Access', reconnect: 'Restore Mobile Access',
+    disconnect: 'Cut Off', reconnect: 'Restore',
     devices: 'Paired phones', addDevice: 'Add Device', noDevices: 'No paired devices',
     rename: 'Rename', revoke: 'Revoke', presenceOnline: 'Connected',
     justNow: 'Last seen just now', lastSeen: 'Last seen %s ago',
     minutes: '%dmin', hours: '%dh', days: '%dd',
     pair: 'Pair a Phone', copy: 'Copy Pairing String', copied: 'Copied',
-    scanHint: 'Scan this code with DeepSeek Harness on iPhone. It is single use and expires in five minutes.',
+    scanHint: 'Scan this code with the DeepSeek Harness mobile APP on iPhone. It is single use and expires in five minutes.',
     thisMac: 'Phones will see this Mac as \u201C%s\u201D',
     offline: 'Waiting for the relay connection; this code still works once it is up.',
     newCode: 'New QR Code',
@@ -276,15 +278,14 @@ dialog .buttons .primary { font-weight: 600; }
     title: '\u79FB\u52A8\u7AEF\u8BBF\u95EE', relay: '\u4E2D\u8F6C\u670D\u52A1',
     relayUp: '\u5DF2\u8FDE\u4E0A\u4E2D\u8F6C', relayDown: '\u672A\u8FDE\u4E0A\u4E2D\u8F6C',
     relayCut: '\u5DF2\u5207\u65AD\u79FB\u52A8\u7AEF\u8BBF\u95EE',
-    disconnect: '\u5207\u65AD\u79FB\u52A8\u7AEF\u8BBF\u95EE',
-    reconnect: '\u6062\u590D\u79FB\u52A8\u7AEF\u8BBF\u95EE',
+    disconnect: '\u5207\u65AD', reconnect: '\u6062\u590D',
     devices: '\u5DF2\u914D\u5BF9\u7684\u624B\u673A', addDevice: '\u6DFB\u52A0\u8BBE\u5907',
     noDevices: '\u8FD8\u6CA1\u6709\u914D\u5BF9\u7684\u8BBE\u5907',
     rename: '\u91CD\u547D\u540D', revoke: '\u540A\u9500',
     presenceOnline: '\u5DF2\u8FDE\u63A5', justNow: '\u521A\u521A\u8FD8\u5728\u7EBF',
     lastSeen: '%s\u524D\u5728\u7EBF', minutes: '%d\u5206\u949F', hours: '%d\u5C0F\u65F6', days: '%d\u5929',
     pair: '\u914D\u5BF9\u624B\u673A', copy: '\u590D\u5236\u914D\u5BF9\u4E32', copied: '\u5DF2\u590D\u5236',
-    scanHint: '\u7528 iPhone \u4E0A\u7684 DeepSeek Harness \u626B\u63CF\u6B64\u7801\u3002\u4E00\u7801\u4E00\u53F0\u8BBE\u5907\uFF0C5 \u5206\u949F\u540E\u5931\u6548\u3002',
+    scanHint: '\u7528 iPhone \u4E0A\u7684 DeepSeek Harness mobile APP \u626B\u63CF\u6B64\u7801\u3002\u4E00\u7801\u4E00\u53F0\u8BBE\u5907\uFF0C5 \u5206\u949F\u540E\u5931\u6548\u3002',
     thisMac: '\u624B\u673A\u4E0A\u4F1A\u663E\u793A\u4E3A\u201C%s\u201D',
     offline: '\u5C1A\u672A\u8FDE\u4E0A\u4E2D\u8F6C\uFF0C\u8FDE\u4E0A\u540E\u6B64\u7801\u4F9D\u7136\u6709\u6548\u3002',
     newCode: '\u91CD\u65B0\u751F\u6210\u4E8C\u7EF4\u7801',
@@ -473,7 +474,7 @@ dialog .buttons .primary { font-weight: 600; }
       return
     }
 
-    var src = '/mobile/qr?v=' + encodeURIComponent(pairing.expiresAt)
+    var src = '${QR_PATH}?v=' + encodeURIComponent(pairing.expiresAt)
     if (qr.getAttribute('src') !== src) qr.setAttribute('src', src)
     qr.hidden = false
     actions.hidden = false
