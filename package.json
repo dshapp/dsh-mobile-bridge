@@ -68,6 +68,6 @@
     "prepare": "tsdown",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "check": "npm run typecheck && npm run build",
-    "test": "node --experimental-strip-types test/allowlist.test.ts"
+    "test": "node --experimental-strip-types test/allowlist.test.ts && node --experimental-strip-types test/rpc.test.ts"
   }
 }

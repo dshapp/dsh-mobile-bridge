@@ -21,9 +21,18 @@ import { createGzip } from 'node:zlib'
 import type { ConnectionFetchHandler } from '@deepseek-ai/dsh-client-connection'
 import type { TypertGatewayWireStream } from '@deepseek-ai/dsh-api-gateway/types'
 import { WebSocketServer, type WebSocket } from 'ws'
+import { SessionStore, serveRpcPipe } from './rpc.ts'
 
 /** The Gateway's one WebSocket route, mirrored here for mobile clients. */
 const REMOTE_STREAM_MUX_PATH = '/api/remote.mux'
+/**
+ * The RPC pipe: one socket carrying every `/api` call a phone makes.
+ *
+ * It exists so the public proxy can splice bytes instead of re-originating an
+ * HTTP request per call. Authorisation is unchanged - see {@link serveRpcPipe},
+ * which puts every framed call through {@link classifyApiRequest}.
+ */
+const RPC_MUX_PATH = '/api/rpc.mux'
 /** Same ceiling the web carrier applies to a buffered /api body. */
 const MAX_REQUEST_BODY_BYTES = 300 * 1024 * 1024
 
@@ -50,6 +59,7 @@ const DEFAULT_API_ALLOWLIST: readonly string[] = [
   '/api/file',
   '/api/session/uploadFileBinary',
   '/api/remote.mux',
+  '/api/rpc.mux',
   '/api/changes.summary',
   '/api/changes.diff',
 ]
@@ -270,15 +280,23 @@ export function createMobileServer(
   const server = createServer((req, res) => {
     void serve(req, res, api, allowlist).catch(() => { res.destroy() })
   })
+  // Reply history outlives any one socket, because resuming a dropped pipe
+  // is the whole point of keeping it.
+  const rpcSessions = new SessionStore()
   server.on('upgrade', (req, socket, head) => {
     const path = new URL(req.url ?? '/', 'http://mobile.dsh').pathname
-    // A WebSocket is not an RPC call: only the exact mux route, and only when
-    // the operator has not removed it from the allowlist.
-    if (path !== REMOTE_STREAM_MUX_PATH || !allowlist.has(path)) {
+    // A WebSocket is not an RPC call: only the exact socket routes, and only
+    // when the operator has not removed them from the allowlist.
+    const known = path === REMOTE_STREAM_MUX_PATH || path === RPC_MUX_PATH
+    if (!known || !allowlist.has(path)) {
       socket.destroy()
       return
     }
     sockets.handleUpgrade(req, socket as Duplex, head, (websocket) => {
+      if (path === RPC_MUX_PATH) {
+        serveRpcPipe(websocket, api, allowlist, rpcSessions)
+        return
+      }
       serveRemoteStreams(websocket, wireStream)
     })
   })
