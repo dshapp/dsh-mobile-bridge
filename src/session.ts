@@ -9,6 +9,7 @@ import type { Server } from 'node:http'
 import { NoiseSocket } from './duplex.ts'
 import type { MuxStream } from './mux.ts'
 import { Handshake, type KeyPair } from './noise.ts'
+import { bindSocketPeer, type DevicePeers } from './peers.ts'
 import type { DeviceRegistry } from './store.ts'
 import { HEAD_LEN, MAGIC_CLIENT, VERSION } from './wire.ts'
 
@@ -16,6 +17,8 @@ import { HEAD_LEN, MAGIC_CLIENT, VERSION } from './wire.ts'
 export interface SessionDeps {
   readonly identity: KeyPair
   readonly devices: DeviceRegistry
+  /** Each device's harness Peer; every call on this connection is made as it. */
+  readonly peers: DevicePeers
   readonly server: Server
   /**
    * Milliseconds the preamble and the Noise handshake may take, together.
@@ -86,9 +89,14 @@ export async function serveStream(stream: MuxStream, deps: SessionDeps): Promise
     else socket.destroy()
   })
   stream.onEnd(release)
+  // The device's Peer is held for exactly as long as this connection is: the
+  // last of its connections to end disposes it (see peers.ts).
+  const lease = deps.peers.acquire(deviceId)
+  stream.onEnd(lease.release)
 
   await writeFrame(stream, handshake.write())
   socket = new NoiseSocket(stream, handshake.split())
+  bindSocketPeer(socket, lease.peer)
   deps.server.emit('connection', socket)
 }
 

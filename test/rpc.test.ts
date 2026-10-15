@@ -35,34 +35,48 @@ const allowlist = new Set([
   '/api/changes.diff',
 ])
 
-/** A handler that records what reached it and answers with the path. */
-function recordingApi(): { api: any, seen: string[] } {
+/** The Peer a phone's calls are made as; the harness requires one on every call. */
+const peer: any = { id: 'phone', principal: { kind: 'owner' }, signal: new AbortController().signal }
+
+/** A handler that records what reached it, and as whom, and answers with the path. */
+function recordingApi(): { api: any, seen: string[], peers: unknown[] } {
   const seen: string[] = []
+  const peers: unknown[] = []
   const api = {
     requestBodyMode: () => 'buffered' as const,
-    fetch: async (request: Request) => {
+    fetch: async (request: Request, as: unknown) => {
       seen.push(new URL(request.url).pathname)
+      peers.push(as)
       return new Response(JSON.stringify({ ok: true }), {
         status: 200,
         headers: { 'content-type': 'application/json' },
       })
     },
   }
-  return { api, seen }
+  return { api, seen, peers }
 }
 
 await test('an allowed RPC path reaches the handler', async () => {
   const { api, seen } = recordingApi()
   const reply = await dispatchCall(
-    { t: 'call', id: 1, path: '/api/session/list', body: {} }, api, allowlist)
+    { t: 'call', id: 1, path: '/api/session/list', body: {} }, api, allowlist, peer)
   assert.equal(reply.status, 200)
   assert.deepEqual(seen, ['/api/session/list'])
+})
+
+await test('every dispatched call is made as the pipe\'s Peer', async () => {
+  // dsh 0.2 reads peer.signal on every call; a call without one fails inside
+  // the harness ("Cannot read properties of undefined (reading 'signal')").
+  const { api, peers } = recordingApi()
+  await dispatchCall({ t: 'call', id: 1, path: '/api/session/list', body: {} }, api, allowlist, peer)
+  assert.equal(peers.length, 1)
+  assert.equal(peers[0], peer)
 })
 
 await test('the control plane is refused with 403 and never reaches the handler', async () => {
   const { api, seen } = recordingApi()
   const reply = await dispatchCall(
-    { t: 'call', id: 1, path: '/api/mobileBridge/pair', body: {} }, api, allowlist)
+    { t: 'call', id: 1, path: '/api/mobileBridge/pair', body: {} }, api, allowlist, peer)
   assert.equal(reply.status, 403)
   assert.deepEqual(seen, [], 'the control plane must not be dispatched')
 })
@@ -70,7 +84,7 @@ await test('the control plane is refused with 403 and never reaches the handler'
 await test('a path outside the allowlist is refused with 404', async () => {
   const { api, seen } = recordingApi()
   const reply = await dispatchCall(
-    { t: 'call', id: 1, path: '/api/changes.open', body: {} }, api, allowlist)
+    { t: 'call', id: 1, path: '/api/changes.open', body: {} }, api, allowlist, peer)
   assert.equal(reply.status, 404)
   assert.deepEqual(seen, [])
 })
@@ -78,7 +92,7 @@ await test('a path outside the allowlist is refused with 404', async () => {
 await test('a traversal path cannot smuggle in the control plane', async () => {
   const { api, seen } = recordingApi()
   const reply = await dispatchCall(
-    { t: 'call', id: 1, path: '/api/session/../mobileBridge/pair', body: {} }, api, allowlist)
+    { t: 'call', id: 1, path: '/api/session/../mobileBridge/pair', body: {} }, api, allowlist, peer)
   assert.equal(reply.status, 403, 'URL normalisation must not open a side door')
   assert.deepEqual(seen, [])
 })
@@ -86,7 +100,7 @@ await test('a traversal path cannot smuggle in the control plane', async () => {
 await test('a query string does not change the verdict', async () => {
   const { api, seen } = recordingApi()
   const reply = await dispatchCall(
-    { t: 'call', id: 1, path: '/api/mobileBridge/revoke?x=1', body: {} }, api, allowlist)
+    { t: 'call', id: 1, path: '/api/mobileBridge/revoke?x=1', body: {} }, api, allowlist, peer)
   assert.equal(reply.status, 403)
   assert.deepEqual(seen, [])
 })
@@ -97,7 +111,7 @@ await test('a handler failure becomes 502, not a dropped pipe', async () => {
     fetch: async () => { throw new Error('harness is down') },
   }
   const reply = await dispatchCall(
-    { t: 'call', id: 4, path: '/api/session/list', body: {} }, api as any, allowlist)
+    { t: 'call', id: 4, path: '/api/session/list', body: {} }, api as any, allowlist, peer)
   assert.equal(reply.status, 502)
   assert.equal(reply.id, 4)
 })
@@ -126,7 +140,7 @@ await test('a request target naming its own origin is refused', () => {
 await test('a smuggled origin never reaches the handler', async () => {
   const { api, seen } = recordingApi()
   const reply = await dispatchCall(
-    { t: 'call', id: 1, path: '//elsewhere/api/session/list', body: {} }, api, allowlist)
+    { t: 'call', id: 1, path: '//elsewhere/api/session/list', body: {} }, api, allowlist, peer)
   assert.equal(reply.status, 404)
   assert.deepEqual(seen, [], 'the handler must not be reached at all')
 })

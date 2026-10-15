@@ -21,6 +21,7 @@ import { createGzip } from 'node:zlib'
 import type { ConnectionFetchHandler } from '@deepseek-ai/dsh-client-connection'
 import type { TypertGatewayWireStream } from '@deepseek-ai/dsh-api-gateway/types'
 import { WebSocketServer, type WebSocket } from 'ws'
+import { socketPeer, type MobilePeer } from './peers.ts'
 import { SessionStore, serveRpcPipe } from './rpc.ts'
 
 /** The Gateway's one WebSocket route, mirrored here for mobile clients. */
@@ -304,7 +305,7 @@ export function createMobileServer(
   // frames. The threshold keeps small projection frames off the zlib path.
   const sockets = new WebSocketServer({ noServer: true, perMessageDeflate: { threshold: 256 } })
   const server = createServer((req, res) => {
-    void serve(req, res, api, allowlist).catch(() => { res.destroy() })
+    void serve(req, res, api, allowlist, socketPeer(req.socket)).catch(() => { res.destroy() })
   })
   // Reply history outlives any one socket, because resuming a dropped pipe
   // is the whole point of keeping it.
@@ -319,16 +320,25 @@ export function createMobileServer(
     // A WebSocket is not an RPC call: only the exact socket routes, and only
     // when the operator has not removed them from the allowlist.
     const known = path === REMOTE_STREAM_MUX_PATH || path === RPC_MUX_PATH
-    if (!known || !allowlist.has(path)) {
+    // Every call a socket carries is made as its device's Peer; a socket with
+    // none never finished the handshake and has no business upgrading.
+    const peer = socketPeer(socket)
+    if (!known || !allowlist.has(path) || peer === undefined || peer.signal.aborted) {
       socket.destroy()
       return
     }
     sockets.handleUpgrade(req, socket as Duplex, head, (websocket) => {
+      // The harness closes its own Remote-stream socket when the Peer goes;
+      // the phone's sockets follow the same rule, so a revoked or departed
+      // device cannot keep a stream open on a disposed Peer.
+      const hangUp = (): void => { websocket.close(1001, 'peer disposed') }
+      peer.signal.addEventListener('abort', hangUp, { once: true })
+      websocket.once('close', () => { peer.signal.removeEventListener('abort', hangUp) })
       if (path === RPC_MUX_PATH) {
-        serveRpcPipe(websocket, api, allowlist, rpcSessions)
+        serveRpcPipe(websocket, api, allowlist, rpcSessions, peer)
         return
       }
-      serveRemoteStreams(websocket, wireStream)
+      serveRemoteStreams(websocket, wireStream, peer)
     })
   })
   const close = async (): Promise<void> => {
@@ -354,7 +364,16 @@ async function serve(
   res: ServerResponse,
   api: ConnectionFetchHandler,
   allowlist: ReadonlySet<string>,
+  peer: MobilePeer | undefined,
 ): Promise<void> {
+  // Only a socket the session bound after a completed handshake has a Peer;
+  // anything else cannot speak for anyone, so it gets nothing.
+  if (peer === undefined || peer.signal.aborted) {
+    res.writeHead(503, { connection: 'close' })
+    res.end()
+    req.resume()
+    return
+  }
   const url = parseMobileUrl(req.url ?? '/')
   if (url === null) {
     res.writeHead(404)
@@ -417,7 +436,7 @@ async function serve(
       duplex: 'half',
     } as RequestInit & { duplex: 'half' })
   }
-  const upstream = await api.fetch(request)
+  const upstream = await api.fetch(request, peer)
   // Honour a caller-declared projection allowlist before compressing: the
   // trimmed JSON is what the relay carries, and the host kept its full copy.
   const response = listKeys === null ? upstream : await trimListProjections(upstream, listKeys)
@@ -466,9 +485,100 @@ async function serve(
   res.end()
 }
 
-/** Serve the Gateway's multiplexed Remote streams over one WebSocket. */
-function serveRemoteStreams(socket: WebSocket, wireStream: TypertGatewayWireStream): void {
-  const streams = new Map<string, AbortController>()
+/**
+ * Uplink bytes one logical stream may hold before it fails.
+ *
+ * The client sends uplink items faster than a slow Remote may read them; past
+ * this the stream is failed rather than letting one phone grow host memory.
+ */
+const MAX_UPLINK_BYTES = 4 * 1024 * 1024
+
+/**
+ * One logical stream's client-to-host items, as the async iterable the Gateway
+ * reads. Items arrive from socket frames; the Remote pulls them at its pace.
+ */
+export class UplinkInbox implements AsyncIterable<unknown> {
+  readonly #items: { value: unknown, bytes: number }[] = []
+  readonly #maxBytes: number
+  readonly #onOverflow: (error: Error) => void
+  #bytes = 0
+  #ended = false
+  #failure: Error | undefined
+  #waiter: (() => void) | undefined
+
+  /**
+   * @param maxBytes - buffered bytes allowed before the stream fails.
+   * @param onOverflow - called once when the ceiling is crossed.
+   */
+  constructor(maxBytes: number, onOverflow: (error: Error) => void) {
+    this.#maxBytes = maxBytes
+    this.#onOverflow = onOverflow
+  }
+
+  /** Queue one item; `bytes` is the frame size it arrived in. */
+  push(value: unknown, bytes: number): void {
+    if (this.#ended || this.#failure !== undefined) return
+    this.#bytes += bytes
+    if (this.#bytes > this.#maxBytes) {
+      const error = new Error('mobile-bridge: Remote stream uplink overflow')
+      this.fail(error)
+      this.#onOverflow(error)
+      return
+    }
+    this.#items.push({ value, bytes })
+    this.#wake()
+  }
+
+  /** The client finished sending. */
+  end(): void {
+    this.#ended = true
+    this.#wake()
+  }
+
+  /** Stop the iterator with an error; later pushes are dropped. */
+  fail(error: Error): void {
+    if (this.#failure !== undefined) return
+    this.#failure = error
+    this.#items.length = 0
+    this.#wake()
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<unknown> {
+    for (;;) {
+      const next = this.#items.shift()
+      if (next !== undefined) {
+        this.#bytes -= next.bytes
+        yield next.value
+        continue
+      }
+      if (this.#failure !== undefined) throw this.#failure
+      if (this.#ended) return
+      await new Promise<void>((resolve) => { this.#waiter = resolve })
+    }
+  }
+
+  #wake(): void {
+    const waiter = this.#waiter
+    this.#waiter = undefined
+    waiter?.()
+  }
+}
+
+/** One open logical stream on the Remote-stream socket. */
+interface ActiveStream {
+  readonly abort: AbortController
+  readonly inbox: UplinkInbox
+}
+
+/**
+ * Serve the Gateway's multiplexed Remote streams over one WebSocket.
+ *
+ * Mirrors the harness's own carrier: `open` / `item` / `end` / `cancel` from
+ * the client, `item` / `end` / `error` back, and every stream opened as the
+ * socket's Peer.
+ */
+function serveRemoteStreams(socket: WebSocket, wireStream: TypertGatewayWireStream, peer: MobilePeer): void {
+  const streams = new Map<string, ActiveStream>()
   let writes = Promise.resolve()
 
   const send = (message: unknown): Promise<void> => {
@@ -483,9 +593,10 @@ function serveRemoteStreams(socket: WebSocket, wireStream: TypertGatewayWireStre
     return delivery
   }
 
-  const pump = async (streamId: string, endpoint: string, payload: unknown, abort: AbortController): Promise<void> => {
+  const pump = async (streamId: string, endpoint: string, payload: unknown, active: ActiveStream): Promise<void> => {
+    const { abort, inbox } = active
     try {
-      const source = await wireStream.open(endpoint, payload, abort.signal)
+      const source = await wireStream.open(endpoint, payload, inbox, peer, abort.signal)
       for await (const value of source) await send({ type: 'item', streamId, value })
       if (!abort.signal.aborted) await send({ type: 'end', streamId })
     } catch (error) {
@@ -497,8 +608,14 @@ function serveRemoteStreams(socket: WebSocket, wireStream: TypertGatewayWireStre
         }
       }
     } finally {
+      inbox.fail(new Error('Remote stream ended'))
       streams.delete(streamId)
     }
+  }
+
+  const stop = (active: ActiveStream, reason: Error): void => {
+    active.abort.abort(reason)
+    active.inbox.fail(reason)
   }
 
   socket.on('message', (data, isBinary) => {
@@ -506,27 +623,41 @@ function serveRemoteStreams(socket: WebSocket, wireStream: TypertGatewayWireStre
       socket.close(1003, 'text messages required')
       return
     }
-    let message: { type?: string, streamId?: string, endpoint?: string, payload?: unknown }
+    const text = String(data)
+    let message: { type?: string, streamId?: string, endpoint?: string, payload?: unknown, value?: unknown }
     try {
-      message = JSON.parse(String(data)) as typeof message
+      message = JSON.parse(text) as typeof message
     } catch {
       socket.close(1008, 'invalid Remote stream request')
       return
     }
     const streamId = message.streamId
     if (typeof streamId !== 'string') return
+    // item / end / cancel for a stream that already finished are dropped: the
+    // client's in-flight frames keep arriving after the host side is done.
     if (message.type === 'cancel') {
-      streams.get(streamId)?.abort(new Error('Remote stream cancelled'))
+      const active = streams.get(streamId)
+      if (active !== undefined) stop(active, new Error('Remote stream cancelled'))
+      return
+    }
+    if (message.type === 'item') {
+      streams.get(streamId)?.inbox.push(message.value, Buffer.byteLength(text, 'utf8'))
+      return
+    }
+    if (message.type === 'end') {
+      streams.get(streamId)?.inbox.end()
       return
     }
     if (message.type !== 'open' || typeof message.endpoint !== 'string' || streams.has(streamId)) return
     const abort = new AbortController()
-    streams.set(streamId, abort)
-    void pump(streamId, message.endpoint, message.payload, abort)
+    const inbox = new UplinkInbox(MAX_UPLINK_BYTES, (error) => { abort.abort(error) })
+    const active: ActiveStream = { abort, inbox }
+    streams.set(streamId, active)
+    void pump(streamId, message.endpoint, message.payload, active)
   })
 
   socket.once('close', () => {
-    for (const abort of streams.values()) abort.abort(new Error('Remote stream socket closed'))
+    for (const active of streams.values()) stop(active, new Error('Remote stream socket closed'))
     streams.clear()
   })
   socket.once('error', () => { socket.terminate() })

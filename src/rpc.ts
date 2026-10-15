@@ -22,6 +22,7 @@ import { randomBytes } from 'node:crypto'
 import type { ConnectionFetchHandler } from '@deepseek-ai/dsh-client-connection'
 import type { WebSocket } from 'ws'
 import { classifyApiRequest, parseMobileUrl } from './http.ts'
+import type { MobilePeer } from './peers.ts'
 
 /** A call the client asked for. */
 export interface RpcCall {
@@ -192,6 +193,7 @@ export async function dispatchCall(
   call: RpcCall,
   api: ConnectionFetchHandler,
   allowlist: ReadonlySet<string>,
+  peer: MobilePeer,
 ): Promise<RpcReply> {
   const url = parseMobileUrl(call.path)
   if (url === null) {
@@ -212,7 +214,7 @@ export async function dispatchCall(
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(call.body ?? {}),
-    }))
+    }), peer)
     const text = await response.text()
     let body: unknown
     try {
@@ -242,6 +244,7 @@ export function serveRpcPipe(
   api: ConnectionFetchHandler,
   allowlist: ReadonlySet<string>,
   store: SessionStore,
+  peer: MobilePeer,
 ): void {
   let writes = Promise.resolve()
 
@@ -299,7 +302,7 @@ export function serveRpcPipe(
       void running.then(send)
       return
     }
-    const work = dispatchCall(frame, api, allowlist)
+    const work = dispatchCall(frame, api, allowlist, peer)
     store.begin(current, frame.id, work)
     void work.then((reply) => {
       store.finish(current, reply)

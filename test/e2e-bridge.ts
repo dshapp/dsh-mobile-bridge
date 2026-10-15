@@ -10,6 +10,7 @@
  */
 
 import { createMobileServer } from '../src/http.ts'
+import { DevicePeers } from '../src/peers.ts'
 import { serveStream } from '../src/session.ts'
 import { DeviceRegistry, loadIdentity } from '../src/store.ts'
 import { ProxyTunnel } from '../src/tunnel.ts'
@@ -51,6 +52,18 @@ const creds = credentials()
 const identity = await loadIdentity(creds)
 const devices = await DeviceRegistry.load(creds, 180)
 const { server } = createMobileServer(api, wireStream, {})
+/** Stand-in for ctx.connection.createPeer: a Peer is only identity + lifetime here. */
+const peers = new DevicePeers(() => {
+  const lifetime = new AbortController()
+  return {
+    id: crypto.randomUUID(),
+    principal: { kind: 'owner' },
+    interactions: 'answer',
+    signal: lifetime.signal,
+    ctx: undefined,
+    async dispose() { lifetime.abort() },
+  } as any
+})
 
 const pairing = devices.createPairing()
 
@@ -59,7 +72,7 @@ const tunnel = new ProxyTunnel({
   port,
   identity,
   onStream: (stream: any) => {
-    void serveStream(stream, { identity, devices, server, handshakeTimeoutMs: 10_000 })
+    void serveStream(stream, { identity, devices, peers, server, handshakeTimeoutMs: 10_000 })
       .catch((error: any) => {
         console.error('bridge: stream failed:', error?.message ?? error)
         stream.close()

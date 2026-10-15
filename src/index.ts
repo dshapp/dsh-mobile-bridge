@@ -17,6 +17,7 @@ import type {} from '@deepseek-ai/dsh-api-gateway/types'
 import { localDeviceName, registerControlApi } from './api.ts'
 import { registerControlPage } from './web.ts'
 import { createMobileServer } from './http.ts'
+import { DevicePeers } from './peers.ts'
 import { serveStream } from './session.ts'
 import { DeviceRegistry, loadIdentity } from './store.ts'
 import { ProxyTunnel } from './tunnel.ts'
@@ -68,6 +69,13 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
 
   const identity = await loadIdentity(ctx.credentials)
   const devices = await DeviceRegistry.load(ctx.credentials, deviceTtlDays)
+  // A paired phone is its owner's other screen: it speaks as the owner, like
+  // the browser does, and answers forwarded prompts (permission requests).
+  // Peers are owned by this plugin's context, so unloading it disposes them.
+  const peers = new DevicePeers(() => ctx.connection.createPeer({
+    principal: { kind: 'owner' },
+    interactions: 'answer',
+  }))
   const { server, close } = createMobileServer(
     ctx.connection.createSharedFetchHandler('/api'),
     ctx.typertGateway.wireStream,
@@ -80,7 +88,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     identity,
     ...config.proxyPublicKey === undefined ? {} : { proxyPublicKey: Buffer.from(config.proxyPublicKey, 'base64') },
     onStream: (stream) => {
-      void serveStream(stream, { identity, devices, server, handshakeTimeoutMs }).catch((error: unknown) => {
+      void serveStream(stream, { identity, devices, peers, server, handshakeTimeoutMs }).catch((error: unknown) => {
         // A device that fails here gets nothing back; the operator still needs
         // to see why, so this is a warning rather than a silent drop.
         ctx.logger.warn(error)
