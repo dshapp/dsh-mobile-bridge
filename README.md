@@ -1,7 +1,7 @@
 # dsh-mobile-bridge
 
 Serves this harness's `/api` to paired phones, over a Noise-encrypted tunnel to
-a public [`dsh-proxy`](../dsh-proxy). It opens **no port**, writes **no state
+a public [`dsh-proxy`](https://github.com/dshapp/dsh-proxy). It opens **no port**, writes **no state
 file**, runs **no extra process**, and forges **no cookie**: it is a cordis
 plugin that lives and dies with `dsh server`.
 
@@ -119,3 +119,38 @@ pnpm install
 pnpm run check      # typecheck + build
 dsh plugin --profile web add link:$PWD
 ```
+
+<!-- dsh-family:start -->
+## The DSH App family
+
+**DSH App** is a family of clients and plugins built for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`). Every piece plugs into the **same** dsh on your computer, so sessions, models and plugins are shared everywhere — combine the ones you need. Downloads and docs: **[dshapp.github.io](https://dshapp.github.io/en/)**.
+
+```mermaid
+flowchart LR
+  subgraph pc["Your computer"]
+    mac["macOS App"] --> dsh(["dsh"])
+    cc["dsh-chrome-control"] --- dsh
+    mb["dsh-mobile-bridge"] --- dsh
+    cu["dsh-kimi-computer-use"] --- dsh
+    cs["dsh-claude-subscription"] --- dsh
+    ext["Chrome extension"] <--> cc
+  end
+  android["Android App"] --> proxy["dsh-proxy"]
+  mini["WeChat mini program"] --> proxy
+  proxy <--> mb
+  style mb fill:#0A84FF,stroke:#0A84FF,color:#fff
+```
+
+| | Project | What it does | Links |
+| --- | --- | --- | --- |
+| Clients | **macOS App**<br>`dsh-macapp` | Native SwiftUI client that hosts your local dsh and switches on every extension | [Overview](https://dshapp.github.io/en/products/macos/) · source coming soon |
+|  | **Android App**<br>`dsh-androidapp` | DSH in your pocket: approvals, questions and notifications, end-to-end encrypted | [Overview](https://dshapp.github.io/en/products/android/) · source coming soon |
+|  | **DSH Remote (WeChat)**<br>`dsh-miniapp` | No install: take over DSH from WeChat on iPhone or Android | [Overview](https://dshapp.github.io/en/products/miniapp/) · source coming soon |
+|  | **Chrome extension**<br>`dsh-chrome-extension` | DSH in the browser side panel, and the executing half of browser control | [Overview](https://dshapp.github.io/en/products/chrome/) · source coming soon |
+| dsh plugins | **Browser control**<br>`dsh-chrome-control` | Hands your signed-in Chrome to the agent as `mcp__chrome__*` tools | [Overview](https://dshapp.github.io/en/products/chrome/) · [Source](https://github.com/dshapp/dsh-chrome-control) |
+|  | **Mobile bridge** ← you are here<br>`dsh-mobile-bridge` | Serves dsh to paired phones over a Noise tunnel, without opening a port | [Overview](https://dshapp.github.io/en/products/android/) |
+|  | **Computer use**<br>`dsh-kimi-computer-use` | Lets the agent operate Mac apps that have no API, in the background | [Overview](https://dshapp.github.io/en/products/cu/) · [Source](https://github.com/dshapp/dsh-kimi-computer-use) |
+|  | **Claude subscription**<br>`dsh-claude-subscription` | Runs Claude models in DSH on your Claude Code subscription, no API key | [Source](https://github.com/dshapp/dsh-claude-subscription) |
+| Infrastructure | **Relay**<br>`dsh-proxy` | The only public piece of mobile access: one port, ciphertext only, no state | [Overview](https://dshapp.github.io/en/docs/crypto/) · [Source](https://github.com/dshapp/dsh-proxy) |
+|  | **Website**<br>`dshapp.github.io` | Downloads, docs and release notes | [Overview](https://dshapp.github.io/en/) · [Source](https://github.com/dshapp/dshapp.github.io) |
+<!-- dsh-family:end -->
