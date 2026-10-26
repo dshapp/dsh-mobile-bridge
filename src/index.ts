@@ -28,13 +28,28 @@ export const name = 'mobile-bridge'
 /** Services this plugin cannot work without. */
 export const inject = ['connection', 'credentials', 'typertGateway']
 
+/** Public dsh-proxy the bridge dials when no `proxyHost` is configured. */
+export const DEFAULT_PROXY_HOST = 'dshproxy.wuhaolin.cn'
+
+/** Port of the default proxy. */
+export const DEFAULT_PROXY_PORT = 8787
+
+/**
+ * Static public key of the default proxy, base64. It is pinned only while the
+ * host is left at its default: a self-hosted proxy has its own key.
+ */
+export const DEFAULT_PROXY_PUBLIC_KEY = 'pAzEKmp+wwUyMLhAaff+0UHSRb69n8RwvzYDeCkEd0A='
+
 /** Where the public proxy is, and how long a pairing lasts. */
 export interface Config {
   /** Public proxy host phones dial. */
   proxyHost?: string
   /** Public proxy port. Bare TCP, no TLS. */
   proxyPort?: number
-  /** Optional base64 proxy static public key to pin. */
+  /**
+   * Optional base64 proxy static public key to pin. Defaults to the default
+   * proxy's key when `proxyHost` is unset; an empty string disables pinning.
+   */
   proxyPublicKey?: string
   /** Days a paired device stays valid. */
   deviceTtlDays?: number
@@ -61,8 +76,10 @@ export interface Config {
  * @param config - proxy address and pairing lifetime.
  */
 export async function apply(ctx: Context, config: Config = {}): Promise<void> {
-  const proxyHost = config.proxyHost ?? '127.0.0.1'
-  const proxyPort = config.proxyPort ?? 8787
+  const proxyHost = config.proxyHost ?? DEFAULT_PROXY_HOST
+  const proxyPort = config.proxyPort ?? DEFAULT_PROXY_PORT
+  const proxyPublicKey = config.proxyPublicKey
+    ?? (config.proxyHost === undefined ? DEFAULT_PROXY_PUBLIC_KEY : '')
   const deviceTtlDays = config.deviceTtlDays ?? 180
   const deviceName = (config.deviceName ?? '').trim() || localDeviceName()
   const handshakeTimeoutMs = config.handshakeTimeoutMs ?? 10_000
@@ -86,7 +103,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     host: proxyHost,
     port: proxyPort,
     identity,
-    ...config.proxyPublicKey === undefined ? {} : { proxyPublicKey: Buffer.from(config.proxyPublicKey, 'base64') },
+    ...proxyPublicKey === '' ? {} : { proxyPublicKey: Buffer.from(proxyPublicKey, 'base64') },
     onStream: (stream) => {
       void serveStream(stream, { identity, devices, peers, server, handshakeTimeoutMs }).catch((error: unknown) => {
         // A device that fails here gets nothing back; the operator still needs

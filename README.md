@@ -37,9 +37,9 @@ dsh plugin --profile web add dsh-mobile-bridge
 ```yaml
 - id: mobile-bridge
   config:
-    proxyHost: 127.0.0.1   # public proxy the phone dials
+    proxyHost: dshproxy.wuhaolin.cn   # public proxy the phone dials
     proxyPort: 8787
-    proxyPublicKey: ''     # optional base64 key to pin
+    proxyPublicKey: pAzEKmp+wwUyMLhAaff+0UHSRb69n8RwvzYDeCkEd0A=   # base64 key to pin; '' disables
     deviceTtlDays: 180
     handshakeTimeoutMs: 10000   # preamble + Noise_IK deadline
     apiAllowlist: []       # extra exact /api routes, added to the defaults
